@@ -1,0 +1,26 @@
+# This machine's settings (paths, URL, guard rules): written by install.sh.
+/config.local.php
+
+# Generated per board: each board's entry folder ({key}/index.php, api.php, roadmap/).
+# Everything at the top level is ignored except the statusboard's own code.
+/*/
+!/app/
+!/bin/
+!/lib/
+!/protocols/
+!/templates/
+!/docs/
+
+# The statusboard's own hooks, installed into its dir with absolute paths for this machine.
+/.claude/
+
+# Data never lives here (it is in ~/.claude/statusboard), but just in case.
+*.db
+*.db-wal
+*.db-shm
+*.token
+*.log
+.DS_Store
+/DEVELOPER.local.md
+# Personal patterns release.sh refuses to publish (this machine's own).
+/release-deny.local

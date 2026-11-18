@@ -1,0 +1,1709 @@
+#!/usr/bin/env php
+<?php
+/**
+ * sb - statusboard CLI. Sessions use it to report tasks, maps and steps; hooks use `sb hook <Event>`.
+ * Run `sb help` for the command list.
+ */
+
+require __DIR__ . '/../lib/Store.php';
+
+use Statusboard\Store;
+use Statusboard\Validation;
+
+const NO_PROJECT = 'this directory is not part of any board: create one from the statusboard index (`sb pair` opens it)';
+
+$argv0 = array_shift($argv);
+$cmd = array_shift($argv) ?? 'help';
+
+try {
+    if ($cmd === 'hook') {
+        hook($argv[0] ?? '');
+        exit(0);
+    }
+    if ($cmd === 'statusline') {
+        statusline();
+        exit(0);
+    }
+    if ($cmd === 'close-session') {
+        // Launched detached by the Stop hook of an archived session: waits for it to be idle, then closes it.
+        posix_setsid();
+        Store::closeWhenIdle($argv[0] ?? '');
+        exit(0);
+    }
+    if ($cmd === 'validation-resume') {
+        // Started detached when a round paused on a usage limit: runs every paused round whose limit has reset.
+        // With an id (`sb validation-resume t1234a-r3`): that paused round now, for when the limit is back earlier.
+        $only = $argv[0] ?? null;
+        if ($only !== null && (Validation::get($only)['status'] ?? null) !== 'paused') { fwrite(STDERR, "sb: $only is not a paused round\n"); exit(1); }
+        $n = Validation::resumeDue($only);
+        echo $only === null ? "$n paused round(s) resumed\n" : ($n ? "$only resumed as round " . Validation::latest(Validation::get($only)['task_id'])['round'] . "\n" : "$only was not resumed: its task is no longer validating on it\n");
+        exit($only !== null && !$n ? 1 : 0);
+    }
+    if ($cmd === 'validation-run') {
+        // Detach from the builder's tool call and terminal so the validator outlives both.
+        if (pcntl_fork() > 0) exit(0);
+        posix_setsid();
+        Validation::run($argv[0] ?? '');
+        exit(0);
+    }
+    if (getenv('SB_VALIDATION')) exit(validatorCli($cmd, $argv));
+    exit(cli($cmd, $argv));
+} catch (Throwable $e) {
+    if ($cmd === 'statusline') exit(0); // never break the terminal's status line
+    if ($cmd === 'hook') {
+        // A hook must never break the session; log and carry on.
+        @file_put_contents(Store::dataDir() . '/errors.log', date('c') . " hook {$argv[0]}: " . $e->getMessage() . "\n", FILE_APPEND);
+        // Except the validator guard, which fails closed.
+        if (getenv('SB_VALIDATION') && ($argv[0] ?? '') === 'PreToolUse') {
+            echo json_encode(['hookSpecificOutput' => ['hookEventName' => 'PreToolUse', 'permissionDecision' => 'deny', 'permissionDecisionReason' => '[validator guard] the guard failed, so this call is refused']]);
+        }
+        exit(0);
+    }
+    fwrite(STDERR, 'sb: ' . $e->getMessage() . "\n");
+    exit(1);
+}
+
+/* =====================================================================
+ * CLI
+ * ===================================================================== */
+
+function cli(string $cmd, array $args): int {
+    $sid = Store::currentSessionId();
+    // A session outside every board (e.g. running `sb serve` from another project) leaves no row behind.
+    $session = $sid && (Store::projectForCwd(getcwd()) || Store::one('SELECT 1 FROM sessions WHERE session_id = ?', [$sid])) ? ensureSession($sid) : null;
+    // Outside a Claude session (the user's own terminal) the project is the one the current dir belongs to.
+    $project = $session['project'] ?? Store::projectForCwd(getcwd());
+    // The developer's roadmap is the statusboard's, whichever directory it runs in: board work never lands on a project's roadmap.
+    $rmProject = !empty($session['is_developer']) ? Store::BOARD_PROJECT : $project;
+
+    switch ($cmd) {
+        case 'new':
+        case 'side':
+            need($session, 'not inside a Claude session');
+            $title = trim(implode(' ', $args)) ?: fail('usage: sb new "title"');
+            $id = Store::newTaskId();
+            $kind = $cmd === 'side' ? 'side' : 'work';
+            $now = time();
+            Store::exec(
+                'INSERT INTO tasks (id, project, session_id, kind, title, status, created_at, updated_at, thread_id) VALUES (?,?,?,?,?,?,?,?,?)',
+                [$id, $project, $sid, $kind, $title, $kind === 'side' ? 'working' : 'analysing', $now, $now, $session['thread_id']]
+            );
+            if ($session['thread_id']) Store::setThread((int)$session['thread_id'], ['status' => 'active']);
+            Store::exec('UPDATE sessions SET current_task = ? WHERE session_id = ?', [$id, $sid]);
+            Store::event($project, $sid, $id, 'task_created', $title, ['kind' => $kind]);
+            echo "Task $id created ($kind). Tell the user the id. Next: " . ($kind === 'side' ? 'answer, then `sb done`.' : '`sb analysis`.') . "\n";
+            return 0;
+
+        case 'analysis':
+        case 'solution':
+            $task = currentTask($session);
+            $text = textArg($args) ?: fail("usage: sb $cmd \"markdown\"  (or `-` to read stdin)");
+            $col = $cmd === 'analysis' ? 'analysis_map' : 'solution_map';
+            $status = $cmd === 'analysis' ? 'analysing' : 'planning';
+            Store::touchTask($task['id'], [$col => $text, 'status' => $task['status'] === 'changes_requested' ? 'changes_requested' : $status]);
+            Store::event($task['project'], $sid, $task['id'], "{$cmd}_map", $text);
+            echo ucfirst($cmd) . " map saved on {$task['id']}.\n";
+            return 0;
+
+        case 'steps':
+            $task = currentTask($session);
+            if ($args === ['-']) $args = [textArg($args)];
+            $steps = array_values(array_filter(array_map('trim', count($args) === 1 && str_contains($args[0], "\n") ? explode("\n", $args[0]) : $args)));
+            $steps || fail('usage: sb steps "step one" "step two" ...');
+            Store::exec('DELETE FROM steps WHERE task_id = ?', [$task['id']]);
+            foreach ($steps as $i => $s) {
+                Store::exec('INSERT INTO steps (task_id, idx, text, updated_at) VALUES (?,?,?,?)', [$task['id'], $i + 1, preg_replace('/^[-*\d.)\s]+/', '', $s), time()]);
+            }
+            Store::touchTask($task['id'], ['status' => 'working']);
+            Store::event($task['project'], $sid, $task['id'], 'steps', implode("\n", $steps));
+            echo count($steps) . " steps set on {$task['id']}. Mark progress with `sb step N doing|done`.\n";
+            return 0;
+
+        case 'step':
+            $task = currentTask($session);
+            $n = (int)($args[0] ?? 0) ?: fail('usage: sb step N doing|done|skip|waiting|blocked ["note"]');
+            $status = $args[1] ?? 'done';
+            in_array($status, ['todo', 'doing', 'done', 'skip', 'waiting', 'blocked'], true) || fail("unknown step status $status");
+            $note = trim(implode(' ', array_slice($args, 2))) ?: null;
+            $existing = Store::one('SELECT * FROM steps WHERE task_id = ? AND idx = ?', [$task['id'], $n]);
+            if (!$existing) {
+                // Allows appending a step that was not in the original plan: sb step 6 doing "new step text"
+                $note ?? fail("step $n does not exist; pass a note to add it as a new step");
+                Store::exec('INSERT INTO steps (task_id, idx, text, status, updated_at) VALUES (?,?,?,?,?)', [$task['id'], $n, $note, $status, time()]);
+                $note = null;
+            } else {
+                Store::exec('UPDATE steps SET status = ?, note = COALESCE(?, note), updated_at = ? WHERE task_id = ? AND idx = ?', [$status, $note, time(), $task['id'], $n]);
+            }
+            Store::touchTask($task['id'], ['status' => match (true) {
+                $status === 'blocked' => 'blocked',
+                $status === 'waiting' => 'waiting_user',
+                $task['status'] === 'changes_requested' => 'changes_requested',
+                // A step ticked right after `sb handoff` must not pull the task out of validation, or the
+                // verdict finds it "moved on" and is only recorded.
+                $task['status'] === 'validating' => 'validating',
+                default => 'working',
+            }]);
+            $text = Store::one('SELECT text FROM steps WHERE task_id = ? AND idx = ?', [$task['id'], $n])['text'];
+            Store::event($task['project'], $sid, $task['id'], 'step', "$n. $text -> $status" . ($note ? " ($note)" : ''), ['idx' => $n, 'status' => $status]);
+            echo "Step $n -> $status.\n";
+            return 0;
+
+        case 'note':
+            $task = currentTask($session);
+            $text = textArg($args) ?: fail('usage: sb note "finding or decision"');
+            Store::touchTask($task['id']);
+            Store::event($task['project'], $sid, $task['id'], 'note', $text);
+            echo "Noted on {$task['id']}.\n";
+            return 0;
+
+        case 'status':
+            $task = currentTask($session);
+            $status = $args[0] ?? fail('usage: sb status analysing|planning|working|waiting_user|blocked|review ["reason"]');
+            in_array($status, Store::OPEN_STATUSES, true) || fail("unknown status $status (use sb done / sb abandon to close)");
+            if ($status === 'review' && ($gaps = Store::verificationGaps($task, true))) {
+                fail("not handing {$task['id']} to the user yet (verification protocol, see `sb protocols`):\n  - " . implode("\n  - ", $gaps));
+            }
+            Store::touchTask($task['id'], ['status' => $status]);
+            Store::event($task['project'], $sid, $task['id'], 'status', $status . (isset($args[1]) ? ': ' . implode(' ', array_slice($args, 1)) : ''));
+            echo "{$task['id']} -> $status.\n";
+            return 0;
+
+        case 'pair':
+            // Gives this machine's default browser the board cookie through a one-time code that expires in two minutes,
+            // so browser history and server logs never hold a reusable secret. Inside a project it opens that board,
+            // anywhere else the index of boards.
+            $print = in_array('--print', $args, true);
+            // A link that pairs a browser is the user's to copy, not a Claude session's (a prompt-injected one could pass it on).
+            if ($print && (getenv('CLAUDECODE') || $session || !posix_isatty(STDIN))) fail('`sb pair --print` only runs in your own terminal: it prints a link that pairs a browser with the board.');
+            try {
+                Store::boardToken(); // a broken token file is reported here, not as a page that never pairs
+            } catch (RuntimeException $e) {
+                fail($e->getMessage());
+            }
+            $url = Store::baseUrl() . '/' . ($project ? "$project/" : '') . '?pair=' . Store::pairCode();
+            if ($print) {
+                echo "Open this within " . (Store::PAIR_CODE_TTL / 60) . " minutes, once, in the browser to pair:\n$url\n";
+                return 0;
+            }
+            exec('open ' . escapeshellarg($url));
+            echo "Opened the board in your default browser and paired it. For another browser, run `sb pair --print` in your own terminal and open its link there.\n";
+            return 0;
+
+        case 'handoff':
+            $task = currentTask($session);
+            $guide = textArg($args) ?: fail("usage: sb handoff - <<'EOF' with the headings " . implode(', ', Validation::GUIDE_HEADINGS) . ' (see the verification protocol: `sb protocols`)');
+            $last = Validation::latest($task['id']);
+            if (Validation::isRunning($last)) fail("validation {$last['id']} is still running. Wait for it, or stop it from the board.");
+            in_array($task['tier'], ['T1', 'T2', 'T3'], true) || fail('set the tier first: sb tier T1|T2|T3 "why" (built work is at least T1; a report or lookup is T0 and ends with `sb verify -` then `sb done`)');
+            if ($gap = Store::roadmapGap($task)) fail($gap);
+            $checks = Store::checks($task['id']);
+            $checks || fail('log your own checks first (sb check pass|fail|reasoned|skip "what" "evidence"): the validator is a second line, not the first');
+            foreach ($checks as $c) if ($c['result'] === 'fail') fail("unresolved failed check: {$c['what']}. Fix it and log the re-run as pass first.");
+            $missing = array_filter(Validation::GUIDE_HEADINGS, fn($h) => !preg_match('/^\W*' . preg_quote($h, '/') . '\W*:/mi', $guide));
+            if ($missing) fail('the handoff is missing: ' . implode(', ', $missing));
+            // Not a refusal (sb log refuses): a flipped file is still worth a look before the validator reads it as a rewrite.
+            foreach (Store::eolFlipsOfTask($task) as $repo => $flips) fwrite(STDERR, 'Warning: ' . Store::eolFlipMessage($repo, $flips) . "\n\n");
+            $v = Validation::start($task, $guide, $session['model'] ?? null);
+            echo "Handed to an independent validator: round {$v['round']} ({$v['id']}, budget {$v['budget_min']}m).\n"
+                . "Tell the user it is being validated; do not wait for it. A pass closes the task, and findings come back to you as feedback.\n";
+            return 0;
+
+        case 'tier':
+            $task = currentTask($session);
+            $tier = strtoupper($args[0] ?? '');
+            in_array($tier, Store::TIERS, true) || fail('usage: sb tier T0|T1|T2|T3 "why"  (see the verification protocol: `sb protocols`)');
+            Store::touchTask($task['id'], ['tier' => $tier]);
+            Store::event($task['project'], $sid, $task['id'], 'tier', trim($tier . ' ' . implode(' ', array_slice($args, 1))));
+            echo "{$task['id']} is $tier. Required checks: section 2 of the verification protocol (`sb protocols`).\n";
+            return 0;
+
+        case 'check':
+            $task = currentTask($session);
+            $result = strtolower($args[0] ?? '');
+            $what = trim($args[1] ?? '');
+            in_array($result, Store::CHECK_RESULTS, true) && $what !== '' || fail('usage: sb check pass|fail|reasoned|skip "what you checked" "evidence (command + actual result)"');
+            $evidence = trim(implode(' ', array_slice($args, 2)));
+            if ($evidence === '-') $evidence = trim((string)stream_get_contents(STDIN));
+            if ($evidence === '' && $result !== 'skip') fail('a check needs its evidence: the command and the actual result, or the file:line it was reasoned from');
+            Store::event($task['project'], $sid, $task['id'], 'check', "$result: $what", ['result' => $result, 'what' => $what, 'evidence' => mb_substr($evidence, 0, 4000)]);
+            echo "Logged $result: $what\n";
+            return 0;
+
+        case 'verify':
+            $task = currentTask($session);
+            $report = textArg($args) ?: fail("usage: sb verify - <<'EOF' ... EOF  (headings: Claim, Why it works, Evidence, Edge cases, Blast radius, Not verified, Confidence: N%, How to test)");
+            $missing = array_filter(['Claim', 'Why it works', 'Evidence', 'Edge cases', 'Blast radius', 'Not verified', 'Confidence'], fn($h) => !preg_match('/^\W*' . preg_quote($h, '/') . '\W*:/mi', $report));
+            if ($missing) fail('the report is missing: ' . implode(', ', $missing));
+            $conf = Store::parseConfidence($report);
+            Store::touchTask($task['id'], ['verify_report' => $report, 'confidence' => $conf]);
+            Store::event($task['project'], $sid, $task['id'], 'verify', "verification report, confidence {$conf}%");
+            $gaps = Store::verificationGaps(Store::task($task['id']));
+            echo "Report saved (confidence {$conf}%).\n" . ($gaps ? "Still blocking `sb done`:\n  - " . implode("\n  - ", $gaps) . "\n" : "Ready for `sb done`.\n");
+            return 0;
+
+        case 'done':
+        case 'abandon':
+            $task = currentTask($session);
+            $unverified = null;
+            if (($i = array_search('--unverified', $args, true)) !== false) {
+                $unverified = trim($args[$i + 1] ?? '') ?: fail('usage: sb done --unverified "why it is not verified (the user asked to skip testing)" "summary"');
+                array_splice($args, $i, 2);
+            }
+            $summary = textArg($args) ?: fail("usage: sb $cmd \"summary: what changed, how it was verified, anything left open\"");
+            $status = $cmd === 'done' ? 'done' : 'abandoned';
+            // The roadmap entry is owed even when the user waived the testing.
+            if ($status === 'done' && ($gap = Store::roadmapGap($task))) fail("not closing {$task['id']}: $gap");
+            if ($status === 'done' && !$unverified && ($gaps = Store::verificationGaps($task))) {
+                fail("not closing {$task['id']}, verification is incomplete (verification protocol, see `sb protocols`):\n  - " . implode("\n  - ", $gaps));
+            }
+            Store::touchTask($task['id'], ['status' => $status, 'summary' => $summary, 'closed_at' => time()] + ($unverified ? ['unverified' => $unverified] : []));
+            Store::event($task['project'], $sid, $task['id'], $status, $summary);
+            Store::exec('UPDATE sessions SET current_task = NULL WHERE current_task = ?', [$task['id']]);
+            echo "{$task['id']} closed as $status.\n";
+            if ($task['thread_id'] && $status === 'done') {
+                Store::setThread((int)$task['thread_id'], ['status' => 'needs_approval'], "{$task['id']} done, waiting for the user's approval", 'thread_status');
+                echo "Thread #{$task['thread_id']} is now waiting for the user's approval. Report it to the master (SendMessage, starting with \"#{$task['thread_id']}:\").\n";
+            }
+            return 0;
+
+        case 'log':
+            // The roadmap entry for the current task: one per task, a second `sb log` rewrites it.
+            $task = currentTask($session);
+            $task['kind'] === 'side' && fail('a side task changes nothing, so it has no roadmap entry');
+            if (($args[0] ?? '') === '--none') {
+                // Work that must never reach the review queue, where Reviewed OK merges it: test-only integration, a deploy run.
+                $why = trim(implode(' ', array_slice($args, 1))) ?: fail('usage: sb log --none "why this work must never reach the review queue (test-only integration, a deploy run)"');
+                $item = $task['roadmap_id'] ? Store::roadmapItem($rmProject, (string)$task['roadmap_id']) : null;
+                // A picked plan is fine: it gets closed below. An entry already written (by this task or another) is in the review queue.
+                $again = ($task['no_roadmap'] ?? '') !== ''; // a second --none only rewrites the reason
+                if ($again) $item = null;
+                if ($task['roadmap_logged_at'] || ($item && ($item['review'] || !in_array($item['status'], ['planned', 'in_progress'], true)))) {
+                    fail("{$task['id']} already has roadmap entry r{$task['roadmap_id']}: it reaches the review queue through that");
+                }
+                Store::touchTask($task['id'], ['no_roadmap' => $why]);
+                Store::event($task['project'], $sid, $task['id'], 'log', "no roadmap entry: $why");
+                echo "{$task['id']} needs no roadmap entry: $why\n";
+                if ($item) {
+                    // The plan it was picked from is done, with the reason, but never queued for review: review stays empty.
+                    $now = time();
+                    Store::exec("UPDATE roadmap SET status = 'shipped', shipped_at = ?, updated_at = ?, details = ? WHERE id = ?",
+                        [$now, $now, trim(($item['details'] ?? '') . "\n\nDone without a review entry ({$task['id']}): $why"), $item['id']]);
+                    Store::event($task['project'], $sid, $task['id'], 'roadmap', "r{$item['id']} done without a review entry: $why", ['item' => (int)$item['id']]);
+                    echo "r{$item['id']}, the plan it was picked from, is marked shipped with that reason and is not in the review queue.\n";
+                }
+                echo "Nothing is committed, merged or queued for review. Verification is still required before `sb done`.\n";
+                return 0;
+            }
+            $ongoing = in_array('--ongoing', $args, true);
+            $allowEol = in_array('--allow-eol', $args, true); // a deliberate line-ending conversion
+            $text = textArg(array_values(array_diff($args, ['--ongoing', '--allow-eol'])))
+                ?: fail("usage: sb log [--ongoing] [--allow-eol] - <<'EOF' with the headings Title, Kind, Area, What changed, Why, How the user tests it, and optionally Fixed, Urgency and Details. Plain words, no code.");
+            $h = Store::headings($text, Store::LOG_HEADINGS);
+            $missing = array_filter(['Title', 'Kind', 'Area', 'What changed', 'Why'], fn($k) => ($h[$k] ?? '') === '');
+            if ($missing) fail('the entry is missing: ' . implode(', ', $missing));
+            $kind = strtolower($h['Kind']);
+            in_array($kind, Store::ROADMAP_KINDS, true) || fail('Kind must be one of: ' . implode(', ', Store::ROADMAP_KINDS));
+            // Shipped work goes to the user's review queue, so it has to say how the user tries it in the real product.
+            $steps = $h['How the user tests it'] ?? '';
+            if (!$ongoing && ($gap = Store::reviewStepsGap($steps))) {
+                fail("$gap.\nExample:\nHow the user tests it:\nWhere: local, http://localhost:8000/, any account with at least one order\n1. Open Orders and click the newest order: you should see ...\n2. ...\n(For backend-only work: what to trigger, e.g. the cron URL, and where in the product the result shows.) See the session protocol, section Review.");
+            }
+            $urgency = strtolower(trim($h['Urgency'] ?? ''));
+            $urgency === '' || in_array($urgency, Store::REVIEW_URGENCIES, true) || fail('Urgency must be one of: ' . implode(', ', Store::REVIEW_URGENCIES));
+            $item = $task['roadmap_id'] ? Store::roadmapItem($rmProject, (string)$task['roadmap_id']) : null;
+            if ($dup = Store::roadmapDuplicate($rmProject, $h['Title'], $item['id'] ?? null)) {
+                fail("r{$dup['id']} already has this title ({$dup['status']})." . (in_array($dup['status'], ['planned', 'in_progress'], true)
+                    ? " If this task is that work: sb pick r{$dup['id']}, then sb log again." : ' A follow-up gets its own entry: give it a distinct title.'));
+            }
+            $now = time();
+            $row = [
+                'status' => $ongoing ? 'in_progress' : 'shipped', 'kind' => $kind, 'area' => mb_strtolower($h['Area']), 'title' => $h['Title'],
+                'summary' => $h['What changed'], 'why' => $h['Why'], 'fixed' => ($h['Fixed'] ?? '') ?: null,
+                // A picked plan keeps its plan as the details unless the log tells the longer story itself.
+                'details' => ($h['Details'] ?? '') ?: ($item['details'] ?? null),
+                'updated_at' => $now, 'shipped_at' => $ongoing ? null : $now,
+            ];
+            if (!$ongoing) {
+                // Every (re)log of shipped work waits for the user again, even one they had marked OK.
+                $tiers = array_column(Store::all('SELECT tier FROM tasks WHERE roadmap_id = ? OR id = ?', [$item['id'] ?? 0, $task['id']]), 'tier');
+                $row += ['review' => 'ready', 'review_steps' => $steps, 'review_drafted' => 0, 'review_urgency' => $urgency ?: Store::urgencyFromTiers($tiers),
+                    'review_opened_at' => null, 'reviewed_at' => null, 'reviewed_by' => null];
+                // Folded into a newer entry, and now a fix (a failed validation, a note): that commit is not inside the newer
+                // entry's, so its OK would not carry it. It is reviewed on its own again.
+                $unfolded = $item && $item['review'] === 'folded' ? (int)$item['folded_into'] : null;
+                if ($unfolded) $row += ['folded_into' => null, 'folded_at' => null, 'folded_by' => null, 'folded_from' => null];
+                $row['review_urgency_own'] = null; // its new urgency is its own; foldUrgency below raises it again for what is folded into it
+                // Built in a thread worktree: commit it on the thread's branch; Reviewed OK merges exactly this commit into main.
+                $thread = $task['thread_id'] ? Store::thread((int)$task['thread_id']) : null;
+                // Fixing a conflict: the fix has to merge cleanly before it can go back to the user (this also stops an unfinished
+                // merge's conflict markers from being committed below).
+                $fixing = $item && !$item['merged_at'] && $item['conflict_base'] && $thread && $thread['worktree'] && is_dir($thread['worktree']);
+                if ($fixing) {
+                    $mainTree = Store::project($item['project'])['cwd'];
+                    $still = Store::mergeConflictFiles($mainTree, Store::git($thread['worktree'], 'rev-parse HEAD')[1]);
+                    if ($still) fail("r{$item['id']} still conflicts with main in: " . implode(', ', $still) . ". In {$thread['worktree']}: git merge main, resolve it and commit that merge, then sb log again.");
+                    if ($item['conflict_open'] && ($h['Conflict resolution'] ?? '') === '') fail('the entry needs a "Conflict resolution:" heading: what had to be reconciled, in plain words. The user reads it when they review the fix.');
+                }
+                $onMain = Store::onMain($thread);
+                try {
+                    if ($onMain) {
+                        // Shared main tree: only this entry's own files, by path. It is on main at once; Reviewed OK only confirms it.
+                        $taskIds = array_column(Store::all('SELECT id FROM tasks WHERE roadmap_id = ? OR id = ?', [$item['id'] ?? 0, $task['id']]), 'id');
+                        // Files edited since the entry's last commit on main (not its last log: an --ongoing log commits nothing).
+                        $last = json_decode((string)($item['main_commits'] ?? ''), true) ?: [];
+                        $since = $last ? (int)Store::git(Store::project($task['project'])['cwd'], 'log -1 --format=%ct ' . escapeshellarg(end($last)))[1] : 0;
+                        [$commit, $committed] = Store::commitOnMain($task['project'], $taskIds, $since,
+                            "{$h['Title']}\n\n{$h['What changed']}\n\nTask {$task['id']}, thread #{$task['thread_id']} (on main). Roadmap entry logged by `sb log`.", $allowEol);
+                    } else {
+                        $commit = Store::commitWorktree($thread, "{$h['Title']}\n\n{$h['What changed']}\n\nTask {$task['id']}, thread #{$task['thread_id']}. Roadmap entry logged by `sb log`; merged into main when the user marks it Reviewed OK.", $allowEol);
+                    }
+                } catch (RuntimeException $e) {
+                    fail($e->getMessage());
+                }
+                if ($onMain && $commit) {
+                    $mc = $item && !$item['merged_at'] ? (json_decode((string)$item['main_commits'], true) ?: []) : [];
+                    $row['main_commits'] = json_encode([...$mc, $commit]);
+                }
+                if ($fixing) {
+                    // The merge of main is already committed, so there may be nothing new to commit: the entry's commit is the branch head.
+                    $commit = $commit ?: Store::git($thread['worktree'], 'rev-parse HEAD')[1];
+                    $row += ['conflict_open' => 0, 'conflict_note' => ($h['Conflict resolution'] ?? '') ?: $item['conflict_note'],
+                        'conflict_diff' => Store::conflictDiff($mainTree, $item['conflict_base'], $commit, json_decode((string)$item['conflict_files'], true) ?: [])];
+                } elseif ($item && $item['merged_at']) {
+                    $row += ['conflict_open' => 0, 'conflict_files' => null, 'conflict_base' => null, 'conflict_note' => null, 'conflict_diff' => null];
+                }
+                // Nothing left to commit because the builder committed on the branch by hand: the entry is the branch head.
+                if (!$commit && !$fixing && $thread && $thread['worktree'] && is_dir($thread['worktree'])) {
+                    $head = Store::git($thread['worktree'], 'rev-parse HEAD')[1];
+                    $onMain = Store::git(Store::project($task['project'])['cwd'], 'merge-base --is-ancestor ' . escapeshellarg($head) . ' HEAD')[0] === 0;
+                    if (!$onMain && $head !== ($item['git_commit'] ?? null)) $commit = $head;
+                }
+                // The first commit stays across re-logs (a fix logged later still sits inside what was built on the first one).
+                if ($commit) $row += ['git_commit' => $commit, 'git_first_commit' => (!$item || $item['merged_at'] || !$item['git_first_commit']) ? $commit : $item['git_first_commit'],
+                    'merged_at' => null, 'merge_commit' => null, 'merge_error' => null];
+            }
+            if ($item) {
+                Store::exec('UPDATE roadmap SET ' . implode(', ', array_map(fn($k) => "$k = ?", array_keys($row))) . ' WHERE id = ?', [...array_values($row), $item['id']]);
+                $rid = (int)$item['id'];
+            } else {
+                $row += ['project' => $rmProject, 'created_by' => $session['name'], 'created_at' => $now];
+                Store::exec('INSERT INTO roadmap (' . implode(', ', array_keys($row)) . ') VALUES (' . rtrim(str_repeat('?,', count($row)), ',') . ')', array_values($row));
+                $rid = (int)Store::db()->lastInsertId();
+            }
+            Store::touchTask($task['id'], ['roadmap_id' => $rid, 'roadmap_logged_at' => $now, 'no_roadmap' => null]);
+            if (!$ongoing) {
+                Store::foldUrgency($rid);
+                if (!empty($unfolded)) Store::foldUrgency($unfolded);
+            }
+            Store::event($task['project'], $sid, $task['id'], 'roadmap', "r$rid {$row['status']}: {$row['title']}", ['item' => $rid]);
+            echo ($item ? 'Updated' : 'Added') . " roadmap entry r$rid ({$row['status']}) for {$task['id']}." . ($ongoing ? ' Run `sb log` again without --ongoing when it ships.' : " It is in the user's review queue ({$row['review_urgency']}).") . "\n";
+            if (!empty($unfolded)) {
+                Store::event($task['project'], $sid, $task['id'], 'review', "r$rid re-logged after it was folded into r$unfolded: back in the review queue on its own", ['item' => $rid]);
+                echo "r$rid had been folded into r$unfolded. This new work is not inside r$unfolded's commit, so r$rid is back in the queue on its own. If r$unfolded's builder takes this in later, the master can fold it again: sb review fold r$rid --into rN.\n";
+            }
+            if (!empty($row['git_commit']) && !empty($onMain)) echo "Committed on main as " . substr($row['git_commit'], 0, 8) . ' (' . implode(', ', $committed) . "). It is live in the main copy now; Reviewed OK only confirms it.\n";
+            elseif (!empty($onMain)) echo "Nothing to commit on main: no file your task edited with Edit/Write has changes (files made by a shell command are not tracked: redo them with Write, then sb log again).\n";
+            elseif (!empty($row['git_commit'])) echo "Committed on {$thread['branch']} as " . substr($row['git_commit'], 0, 8) . ': the user tests it at ' . (Store::worktreeUrl($thread) ?? $thread['worktree']) . ", and Reviewed OK merges it into main.\n";
+            return 0;
+
+        case 'live':
+            // A thread's worktree at the project's real local URL: `sb live 990114`, `sb live off [project]`, `sb live` for the state.
+            $target = ltrim($args[0] ?? '', '#');
+            if ($target === 'off') {
+                // The named project, else the one you stand in, else the only one that has a thread on (the developer stands in the statusboard).
+                $on = array_values(array_filter(Store::projects(), fn($p) => !empty($p['worktree']) && Store::liveStatus($p['key'])));
+                $here = Store::project((string)Store::projectForCwd(getcwd()));
+                $key = $args[1] ?? (!empty($here['worktree']) ? $here['key'] : (count($on) === 1 ? $on[0]['key'] : fail('which project? sb live off <project>')));
+                $r = Store::liveOff($key);
+                echo ($r['was'] ? "#{$r['was']} is off. " : 'Nothing was on it. ') . "{$r['url']} is the main copy." . ($r['dropped'] ? " The copy {$r['dropped']} was dropped, with anything entered on it; your own database was never touched." : '') . "\n" . ($r['note'] ? "{$r['note']}\n" : '');
+                return 0;
+            }
+            if ($target === 'set' || $target === 'unset') {
+                // What a thread needs to be testable, e.g. `sb live set 990114 signin_instagram_enabled=true`. It goes on the live copy only.
+                $n = ltrim($args[1] ?? '', '#');
+                ctype_digit($n) || fail('usage: sb live set <thread> name=value [name=value ...] | sb live unset <thread> name [...] | sb live set <thread> (lists them)');
+                $changes = [];
+                foreach (array_slice($args, 2) as $a) {
+                    if ($target === 'unset') { $changes[$a] = null; continue; }
+                    str_contains($a, '=') || fail("not name=value: $a");
+                    [$k, $v] = explode('=', $a, 2);
+                    $changes[$k] = $v;
+                }
+                $done = $changes ? Store::setLiveSettings((int)$n, $changes) : null;
+                $all = Store::liveSettings(Store::thread((int)$n) ?? fail("unknown thread #$n"));
+                echo $all ? "#$n's test settings, set on the copy whenever it runs on the real URL:\n" . implode('', array_map(fn($k, $v) => "  $k = $v\n", array_keys($all), $all)) : "#$n declares no test settings.\n";
+                if ($done) echo "It is on now, so the copy got them: " . implode('; ', $done) . "\n";
+                elseif ($done !== null) echo "It is on now: the copy keeps the values it already got until the next run.\n";
+                return 0;
+            }
+            if ($target !== '') {
+                ctype_digit($target) || fail('usage: sb live <thread number> | off [project] (no arguments: the state)');
+                $l = Store::liveOn((int)$target);
+                echo "#{$l['thread']} is on {$l['url']}, on database {$l['db']}." . (isset($l['setup']['migrated']) ? " {$l['setup']['migrated']}" : '') . (!empty($l['setup']['settings']) ? ' Test settings: ' . implode('; ', $l['setup']['settings']) . '.' : '') . ($l['except'] ? ' Still on main: ' . implode(', ', $l['except']) . '.' : '') . " Back to main: sb live off (or the button on the board).\n" . ($l['behind'] ? "Its branch is {$l['behind']} commits behind main: those changes are not in what you see.\n" : '') . ($l['warning'] !== '' ? "{$l['warning']}\n" : '');
+                return 0;
+            }
+            $any = false;
+            foreach (Store::projects() as $p) {
+                if (empty($p['worktree'])) continue;
+                if ($l = Store::liveStatus($p['key'])) { echo "{$p['key']}: #{$l['thread']} is on {$l['url']}, on database {$l['db']}" . (!empty($l['setup']['settings']) ? '; test settings: ' . implode('; ', $l['setup']['settings']) : '') . ($l['except'] ? '; still on main: ' . implode(', ', $l['except']) : '') . ($l['behind'] ? "; {$l['behind']} commits behind main" : '') . ($l['warning'] !== '' ? "; {$l['warning']}" : '') . "\n"; $any = true; }
+                if (Store::livePending($p['key'])) { echo "{$p['key']}: a merge's after-merge step is waiting: sb live off {$p['key']} runs it\n"; $any = true; }
+            }
+            if (!$any) echo "Every real URL serves its main copy.\n";
+            return 0;
+
+        case 'disk':
+            // Free space against each project's next worktree copy: `sb disk`, `sb disk measure`, `sb disk allow` (the user only).
+            $sub = $args[0] ?? '';
+            if ($sub === 'measure') { echo Store::diskMeasure() . " worktree(s) measured.\n"; return 0; }
+            // `sb disk myapp`: another board's numbers (the developer's own project is always the statusboard).
+            if ($sub !== '' && $sub !== 'allow' && Store::project($sub)) { $project = $sub; $sub = ''; }
+            need($project, NO_PROJECT);
+            if ($sub === 'allow') {
+                // Overriding the guard is the user's call: a session that could allow itself would make it pointless.
+                $session && fail('only the user allows a worktree while disk space is low: the board\'s disk chip, or `sb disk allow` in their own terminal.');
+                Store::exec('UPDATE projects SET disk_allow = disk_allow + 1 WHERE key = ?', [$project]);
+                Store::event($project, null, null, 'disk', 'the user allowed one more worktree although disk space is low');
+                echo "One more worktree allowed in $project.\n";
+                return 0;
+            }
+            $d = Store::diskState($project);
+            echo Store::gb($d['free']) . ' free of ' . Store::gb($d['total']) . " ({$d['level']})"
+                . ($d['copy'] ? '; a new copy of ' . $project . ' takes about ' . Store::gb($d['copy']) . " (#{$d['copy_thread']}, the last used)" : ($d['worktrees'] ? '; no worktree measured yet' : '; no thread worktrees here'))
+                . '; red below ' . Store::gb(max(2 * $d['copy'], $d['floor'])) . ($d['allow'] ? "; {$d['allow']} allowed anyway" : '') . "\n";
+            foreach ($d['list'] as $t) echo "  #{$t['id']} [{$t['status']}] " . ($t['disk_bytes'] ? Store::gb((int)$t['disk_bytes']) : 'not measured') . "  {$t['title']}\n";
+            if ($why = Store::diskGate($project, false)) echo "\n$why\n";
+            return 0;
+
+        case 'worktree':
+            // Thread worktrees: `sb worktree` lists them, `sb worktree merge rN` retries a merge, `sb worktree prune` removes merged ones of archived threads.
+            // The repo you stand in, so the developer (or a master) can run it inside any project.
+            $project = need(Store::projectForCwd(getcwd()) ?? $project, NO_PROJECT);
+            $sub = $args[0] ?? 'list';
+            if ($sub === 'merge') {
+                $r = Store::roadmapItem($project, $args[1] ?? '') ?? fail('usage: sb worktree merge rN');
+                $r['review'] === 'ok' || fail("r{$r['id']} is not Reviewed OK yet: only the user's OK merges into main");
+                $r['git_commit'] || fail("r{$r['id']} was not built in a worktree");
+                // Merges exactly the commit the user OK'd. A conflict goes back to the builder (mergeEntry), and its fix returns to the review queue.
+                $m = Store::mergeEntry((int)$r['id']);
+                echo $m['merged'] ? "r{$r['id']} is merged into main (" . substr($m['commit'], 0, 8) . ").\n" : "Not merged: {$m['error']}\n";
+                if (!empty($m['conflict'])) echo $m['owner'] ? "With the builder ({$m['owner']['mode']}): it returns to the review queue when the fix is logged.\n" : "It was already sent to the builder.\n";
+                return $m['merged'] ? 0 : 1;
+            }
+            if ($sub === 'prune') {
+                foreach (Store::pruneWorktrees($project) as $id => $what) echo "#$id: $what\n";
+                return 0;
+            }
+            $p = Store::project($project);
+            if (!$p['worktree']) { echo "$project works in its own tree (no thread worktrees).\n"; return 0; }
+            foreach (Store::all('SELECT * FROM threads WHERE project = ? AND worktree IS NOT NULL ORDER BY id', [$project]) as $t) {
+                $dirty = is_dir($t['worktree']) ? count(array_filter(explode("\n", Store::git($t['worktree'], 'status --porcelain')[1]))) : null;
+                $ahead = Store::git($p['cwd'], 'rev-list --count HEAD..' . escapeshellarg($t['branch']))[1];
+                echo "#{$t['id']} [{$t['status']}] {$t['branch']}  " . ($dirty === null ? 'missing' : "$dirty uncommitted, $ahead commits not in main") . "\n    {$t['worktree']}  " . (Store::worktreeUrl($t) ?? '') . "\n";
+            }
+            return 0;
+
+        case 'model-fallback':
+            // Run detached by scanTranscript: a Fable session stopped by Fable being unavailable goes to Opus once it is idle.
+            [$target, $to] = [$args[0] ?? fail('usage: sb model-fallback <session id> <model>'), $args[1] ?? 'opus'];
+            for ($i = 0; $i < 30; $i++) {
+                try {
+                    echo Store::switchModel($target, $to), "\n";
+                } catch (RuntimeException $e) {
+                    if (!str_contains($e->getMessage(), 'while it is idle')) break;
+                    sleep(2);
+                    continue;
+                }
+                // Switched. Its turn failed on the limit: let it carry on with the work on the new model.
+                $label = Store::config()['models'][$to] ?? $to;
+                $s = Store::one('SELECT project, current_task FROM sessions WHERE session_id = ?', [$target]);
+                try {
+                    Store::typeInto($target, "[statusboard] The usage limit of your previous model was hit, so this session is now on $label. Continue where you left off.");
+                    Store::event($s['project'] ?? null, $target, $s['current_task'] ?? null, 'model', "automatic fallback: now on $label, told it to continue where it left off");
+                } catch (RuntimeException $e) {
+                    Store::event($s['project'] ?? null, $target, $s['current_task'] ?? null, 'model', "automatic fallback: now on $label, but the continue message could not be typed ({$e->getMessage()}). Tell it to continue in its chat.");
+                }
+                return 0;
+            }
+            $s = Store::one('SELECT project, current_task FROM sessions WHERE session_id = ?', [$target]);
+            Store::event($s['project'] ?? null, $target, $s['current_task'] ?? null, 'model', "could not switch it to $to on its own: " . ($e ?? null)?->getMessage() . '. Use the model menu in its chat.');
+            return 1;
+
+        case 'todo':
+            // Reminders for later, with a what and a when: not work (a task) and not shipped work (a roadmap entry).
+            $project = need($project, NO_PROJECT);
+            $by = $session['name'] ?? (getenv('SB_DEPLOY_JOB') ? 'board deploy ' . getenv('SB_DEPLOY_JOB') : 'user');
+            $sub = $args[0] ?? 'list';
+            $line = fn(array $t) => sprintf("%-4s %s%s  [%s%s%s, %s]", "{$t['id']}.", $t['done_at'] ? '(done) ' : ($t['due'] ? 'DUE ' : ''), $t['title'],
+                $t['when_text'] ?? $t['event'] ?? '', $t['event'] && $t['when_text'] && $t['event'] !== $t['when_text'] ? " = {$t['event']}" : '',
+                $t['due_date'] ? ($t['when_text'] || $t['event'] ? ', ' : '') . "on {$t['due_date']}" : '', $t['owner']);
+            switch ($sub) {
+                case 'add':
+                    $title = $args[1] ?? '';
+                    $opt = [];
+                    for ($i = 2; $i < count($args); $i++) {
+                        $k = match ($args[$i]) { '--when' => 'when', '--event' => 'event', '--date' => 'date', '--owner' => 'owner', '--detail' => 'detail', '--steps' => 'steps', default => fail("unknown option {$args[$i]}") };
+                        $opt[$k] = $args[++$i] ?? fail("{$args[$i - 1]} needs a value");
+                    }
+                    ($title !== '' && !str_starts_with($title, '--')) || fail('usage: sb todo add "what" --when "testing deploy" [--date YYYY-MM-DD] [--owner master|#n|me] [--detail "..."] [--steps "1. ...\n2. ..."]');
+                    if (($opt['owner'] ?? '') === 'me') $opt['owner'] = need($sid, 'not inside a Claude session');
+                    $t = Store::todoAdd($project, $title, $opt, $by);
+                    echo "Todo {$t['id']} added: " . $line($t) . "\n"
+                        . ($t['event'] ? "It is due when `sb todo fire {$t['event']}` runs" . (in_array($t['event'], ['testing-deploy', 'prod-deploy'], true) ? ' (the board\'s Sync/Deploy fires it too)' : (str_starts_with($t['event'], 'merge') ? ' (a Reviewed OK merge fires it)' : '')) . ($t['due_date'] ? ', or' : '.') : 'It is due')
+                        . ($t['due_date'] ? " on {$t['due_date']}." : '') . " Its owner ({$t['owner']}) is reminded in each prompt until `sb todo done {$t['id']}`.\n";
+                    return 0;
+                case 'list':
+                    $rows = Store::todos($project, in_array('--all', $args, true));
+                    if (!$rows) { echo "No open todos. Add one: sb todo add \"what\" --when \"testing deploy\"\n"; return 0; }
+                    foreach ($rows as $t) echo $line($t) . "\n" . ($t['detail'] ? "     {$t['detail']}\n" : '') . ($t['steps'] ? preg_replace('/^/m', '     ', $t['steps']) . "\n" : '');
+                    return 0;
+                case 'done':
+                    $id = (int)($args[1] ?? 0) ?: fail('usage: sb todo done <id> ["note"]');
+                    $t = Store::todoDone($project, $id, $by, trim(implode(' ', array_slice($args, 2))) ?: null);
+                    echo "Todo $id done: {$t['title']}\n";
+                    return 0;
+                case 'fire':
+                    $ev = trim(implode(' ', array_slice($args, 1))) ?: fail('usage: sb todo fire <event>  (' . implode(', ', Store::TODO_EVENTS) . ', merge-<thread#> or any slug)');
+                    $hit = Store::todoFire($project, $ev, $by);
+                    if (!$hit) { echo 'No open todos wait for ' . Store::todoEvent($ev) . ".\n"; return 0; }
+                    echo count($hit) . ' todo' . (count($hit) === 1 ? '' : 's') . ' due now for ' . Store::todoEvent($ev) . ":\n";
+                    foreach ($hit as $t) echo $line($t) . "\n" . ($t['detail'] ? "     {$t['detail']}\n" : '') . ($t['steps'] ? preg_replace('/^/m', '     ', $t['steps']) . "\n" : '');
+                    echo "Do them (or tell the owner), then `sb todo done <id>`.\n";
+                    return 0;
+                default:
+                    fail('usage: sb todo add|list [--all]|done <id>|fire <event>');
+            }
+
+        case 'synced':
+            // A project's deploy script reports a sync to a remote box: `sb synced dev1 start|ok|failed [--dry] [--migrate] [--note txt] [--commit sha]`.
+            // Only the repo you stand in: a script run elsewhere must not land on the session's board.
+            $project = need(Store::projectForCwd(getcwd()), NO_PROJECT);
+            [$target, $status] = [$args[0] ?? '', $args[1] ?? ''];
+            ($target !== '' && $status !== '') || fail('usage: sb synced <target> start|ok|failed [--dry] [--migrate] [--note "text"] [--commit sha]');
+            $opt = [];
+            for ($i = 2; $i < count($args); $i++) {
+                match ($args[$i]) {
+                    '--dry' => $opt['dry'] = true,
+                    '--migrate' => $opt['migrate'] = true,
+                    '--note' => $opt['note'] = $args[++$i] ?? fail('--note needs a text'),
+                    '--commit' => $opt['commit'] = $args[++$i] ?? fail('--commit needs a sha'),
+                    '--by' => $opt['by'] = $args[++$i] ?? fail('--by needs a name'),
+                    default => fail("unknown option {$args[$i]}"),
+                };
+            }
+            $s = Store::syncReport($project, $target, $status, $opt, getcwd());
+            echo "sync #{$s['id']} to $target: {$s['status']}" . ($s['dry'] ? ' (dry run)' : '') . ($s['migrate'] ? ', migrate' : '') . ($s['git_commit'] ? " at {$s['git_commit']}" : '') . "\n";
+            // A real sync is that box's deploy: its todos (`--when "<target> deploy"`) are due now.
+            if ($s['status'] === 'ok' && !$s['dry']) foreach (Store::todoFire($project, "$target-deploy", "sync to $target") as $t) echo "Todo due now: {$t['id']}. {$t['title']} (owner {$t['owner']})\n";
+            return 0;
+
+        case 'syncs':
+            // `sb syncs` lists this project's reported syncs; `sb syncs target NAME "label"` shows a box on the board before its first report, `--remove` drops it.
+            $project = need(Store::projectForCwd(getcwd()) ?? $project, NO_PROJECT);
+            if (($args[0] ?? '') === 'target') {
+                $name = $args[1] ?? fail('usage: sb syncs target NAME ["label"|--remove]');
+                $label = ($args[2] ?? $name) === '--remove' ? null : ($args[2] ?? $name);
+                Store::syncTarget($project, $name, $label);
+                echo $label === null ? "Removed $name from the $project board.\n" : "The $project board shows syncs to $name ($label).\n";
+                return 0;
+            }
+            $st = Store::syncState($project, 15);
+            if (!$st) { echo "No syncs reported for $project.\n"; return 0; }
+            foreach ($st as $t) {
+                echo "{$t['target']} ({$t['label']}):\n";
+                if (!$t['history']) echo "    never synced\n";
+                foreach ($t['history'] as $r) {
+                    echo '    #' . $r['id'] . ' ' . date('Y-m-d H:i', (int)$r['started_at']) . "  {$r['status']}" . ($r['dry'] ? ' dry-run' : ' applied') . ($r['migrate'] ? ' +migrate' : '')
+                        . '  ' . ($r['git_commit'] ?? '-') . ($r['dirty'] ? '+dirty' : '') . '  ' . ($r['session_name'] ?? 'terminal') . "\n";
+                }
+            }
+            return 0;
+
+        case 'plan':
+            // Planned work for later: `sb plan -` adds an item, `sb plan rN -` rewrites one that has not shipped.
+            need($session, 'not inside a Claude session');
+            $ref = isset($args[0]) && preg_match('/^r\d+$/i', $args[0]) ? array_shift($args) : null;
+            $text = textArg($args) ?: fail("usage: sb plan [rN] - <<'EOF' with the headings Title, Kind, Area, Priority (high|normal|low), What, Why, Details (the plan)");
+            $project = need($rmProject, NO_PROJECT);
+            $item = $ref ? (Store::roadmapItem($project, $ref) ?? fail("unknown roadmap item $ref")) : null;
+            if ($item && !in_array($item['status'], ['planned', 'in_progress'], true)) fail("r{$item['id']} is {$item['status']}; only planned work can be re-planned");
+            $h = Store::headings($text, Store::PLAN_HEADINGS);
+            $missing = $item ? [] : array_filter(['Title', 'Kind', 'Area', 'What', 'Why'], fn($k) => ($h[$k] ?? '') === '');
+            if ($missing) fail('the plan is missing: ' . implode(', ', $missing));
+            $now = time();
+            $row = array_filter([
+                'title' => $h['Title'] ?? null, 'kind' => isset($h['Kind']) ? strtolower($h['Kind']) : null, 'area' => isset($h['Area']) ? mb_strtolower($h['Area']) : null,
+                'priority' => isset($h['Priority']) ? strtolower($h['Priority']) : null, 'summary' => $h['What'] ?? null, 'why' => $h['Why'] ?? null, 'details' => $h['Details'] ?? null,
+            ], fn($v) => $v !== null && $v !== '');
+            if (isset($row['kind']) && !in_array($row['kind'], Store::ROADMAP_KINDS, true)) fail('Kind must be one of: ' . implode(', ', Store::ROADMAP_KINDS));
+            if (isset($row['priority']) && !in_array($row['priority'], Store::ROADMAP_PRIORITIES, true)) fail('Priority must be one of: ' . implode(', ', Store::ROADMAP_PRIORITIES));
+            if (isset($row['title']) && ($dup = Store::roadmapDuplicate($project, $row['title'], $item['id'] ?? null))) {
+                fail("r{$dup['id']} already has this title ({$dup['status']}). Re-plan it with `sb plan r{$dup['id']} -`, or give this one a distinct title.");
+            }
+            $row['updated_at'] = $now;
+            if ($item) {
+                Store::exec('UPDATE roadmap SET ' . implode(', ', array_map(fn($k) => "$k = ?", array_keys($row))) . ' WHERE id = ?', [...array_values($row), $item['id']]);
+                $rid = (int)$item['id'];
+            } else {
+                $row += ['project' => $project, 'status' => 'planned', 'priority' => $row['priority'] ?? 'normal', 'created_by' => $session['name'], 'created_at' => $now];
+                Store::exec('INSERT INTO roadmap (' . implode(', ', array_keys($row)) . ') VALUES (' . rtrim(str_repeat('?,', count($row)), ',') . ')', array_values($row));
+                $rid = (int)Store::db()->lastInsertId();
+            }
+            Store::event($project, $sid, $session['current_task'], 'roadmap', "r$rid " . ($item ? 're-planned' : 'planned') . ': ' . ($row['title'] ?? $item['title']), ['item' => $rid]);
+            echo ($item ? 'Re-planned' : 'Planned') . " r$rid.\n";
+            return 0;
+
+        case 'pick':
+            // The current task takes on a planned item; its `sb log` then ships that same row.
+            $task = currentTask($session);
+            $item = Store::roadmapItem($rmProject, $args[0] ?? '') ?? fail('usage: sb pick rN (a planned item, see `sb roadmap planned`)');
+            in_array($item['status'], ['planned', 'in_progress'], true) || fail("r{$item['id']} is {$item['status']}, not planned work");
+            if ($task['roadmap_logged_at'] && (int)$task['roadmap_id'] !== (int)$item['id']) fail("{$task['id']} already logged its own entry r{$task['roadmap_id']}");
+            Store::touchTask($task['id'], ['roadmap_id' => $item['id']]);
+            Store::exec("UPDATE roadmap SET status = 'in_progress', updated_at = ? WHERE id = ?", [time(), $item['id']]);
+            Store::event($task['project'], $sid, $task['id'], 'roadmap', "r{$item['id']} picked up: {$item['title']}", ['item' => (int)$item['id']]);
+            echo "{$task['id']} now works on r{$item['id']}: {$item['title']}. Its `sb log` will ship that entry.\n";
+            return 0;
+
+        case 'roadmap':
+            $project = need($rmProject, NO_PROJECT);
+            if (isset($args[0]) && preg_match('/^r\d+$/i', $args[0])) {
+                $item = Store::roadmapItem($project, $args[0]) ?? fail("unknown roadmap item {$args[0]}");
+                if (($args[1] ?? '') === 'drop') {
+                    in_array($item['status'], ['planned', 'in_progress'], true) || fail("r{$item['id']} is {$item['status']}; only planned work can be dropped");
+                    $why = trim(implode(' ', array_slice($args, 2))) ?: fail('usage: sb roadmap rN drop "why"');
+                    Store::exec("UPDATE roadmap SET status = 'dropped', details = ?, updated_at = ? WHERE id = ?", [trim(($item['details'] ?? '') . "\n\nDropped: $why"), time(), $item['id']]);
+                    Store::event($project, $sid, $session['current_task'], 'roadmap', "r{$item['id']} dropped: $why", ['item' => (int)$item['id']]);
+                    echo "r{$item['id']} dropped.\n";
+                    return 0;
+                }
+                printRoadmapItem($item);
+                return 0;
+            }
+            $view = in_array($args[0] ?? '', ['planned', 'shipped', 'all'], true) ? array_shift($args) : 'planned';
+            $q = trim(implode(' ', $args));
+            $where = ['project = ?'];
+            $bind = [$project];
+            if ($view === 'planned') $where[] = "status IN ('planned', 'in_progress')";
+            if ($view === 'shipped') $where[] = "status = 'shipped'";
+            if ($q !== '') {
+                $where[] = '(title LIKE ? OR summary LIKE ? OR area LIKE ?)';
+                array_push($bind, "%$q%", "%$q%", "%$q%");
+            }
+            $rows = Store::all('SELECT * FROM roadmap WHERE ' . implode(' AND ', $where) . ' ORDER BY coalesce(shipped_at, updated_at) DESC LIMIT 60', $bind);
+            if (!$rows) echo "Nothing on the roadmap ($view" . ($q !== '' ? ", \"$q\"" : '') . ").\n";
+            foreach ($rows as $r) {
+                printf("r%-4d %-11s %-11s %-12s %s%s\n", $r['id'], $r['status'], $r['kind'], $r['area'], $r['title'], $r['status'] === 'planned' && $r['priority'] !== 'normal' ? "  ({$r['priority']})" : '');
+            }
+            return 0;
+
+        case 'use':
+        case 'reopen':
+            need($session, 'not inside a Claude session');
+            $task = Store::task($args[0] ?? '') ?? fail('unknown task id');
+            // Working on a task only ever happens inside its own project.
+            $task['project'] === $project || fail("{$task['id']} belongs to another project ({$task['project']})");
+            $reason = trim(implode(' ', array_slice($args, 1)));
+            $set = ['session_id' => $sid];
+            if (!Store::isOpen($task)) $set['status'] = 'working';
+            if ($cmd === 'reopen') $set['closed_at'] = null;
+            Store::touchTask($task['id'], $set);
+            Store::exec('UPDATE sessions SET current_task = ? WHERE session_id = ?', [$task['id'], $sid]);
+            Store::event($task['project'], $sid, $task['id'], $cmd === 'reopen' ? 'reopened' : 'picked_up', $reason ?: null);
+            echo "Now working on {$task['id']}: {$task['title']}\n\n";
+            printTask(Store::task($task['id']));
+            return 0;
+
+        case 'review':
+            // The user's review queue. `sb review` lists it; `sb review rN -` rewrites an entry's test steps
+            // (an owner improving drafted ones). Only the user marks entries reviewed, on the board's Review page.
+            $proj = need($rmProject, NO_PROJECT);
+            // `sb review fold rA rB --into rC`: older entries superseded by a newer one on the same branch leave the queue,
+            // and the newer one's review covers them (its OK merges them too). `sb review unfold rA` undoes it.
+            if (($args[0] ?? '') === 'fold' || ($args[0] ?? '') === 'unfold') {
+                $by = $session['name'] ?? 'a session';
+                $refs = array_slice($args, 1);
+                if ($args[0] === 'unfold') {
+                    $refs || fail('usage: sb review unfold rN...');
+                    foreach ($refs as $ref) {
+                        try {
+                            $o = Store::unfoldEntry($proj, (int)ltrim(strtolower($ref), 'r'), $by);
+                        } catch (RuntimeException $e) {
+                            fail($e->getMessage());
+                        }
+                        echo "r{$o['id']} is back in the review queue on its own (was folded into r{$o['folded_into']}).\n";
+                    }
+                    return 0;
+                }
+                $at = array_search('--into', $refs, true);
+                $usage = 'usage: sb review fold rA rB... --into rC  (rC: the newer entry on the same branch that replaces them)';
+                ($at !== false && isset($refs[$at + 1])) || fail($usage);
+                $into = (int)ltrim(strtolower($refs[$at + 1]), 'r');
+                $olds = array_map(fn($r) => (int)ltrim(strtolower($r), 'r'), array_merge(array_slice($refs, 0, $at), array_slice($refs, $at + 2)));
+                ($into && $olds && !in_array(0, $olds, true)) || fail($usage);
+                try {
+                    $res = Store::foldEntries($proj, $olds, $into, $by);
+                } catch (RuntimeException $e) {
+                    fail($e->getMessage() . '. Nothing was folded.');
+                }
+                $list = implode(', ', array_map(fn($i) => "r$i", $res['folded']));
+                echo "Folded $list into r$into: they left the review queue, and r$into's review page lists them with their test steps. Reviewed OK on r$into merges them with it.\n";
+                if ($res['moved']) echo 'Also moved to r' . $into . ' (they were folded into those): ' . implode(', ', array_map(fn($i) => "r$i", $res['moved'])) . "\n";
+                foreach ($res['warnings'] as $w) echo "Note: $w.\n";
+                echo "If r$into's own test steps do not cover what the user still needs to check from them, rewrite them: sb review r$into - <<'EOF'\n";
+                return 0;
+            }
+            // `sb review rN title "..."`: a better name, e.g. for a fold target that now covers more. Its owner or the master.
+            if (isset($args[0]) && preg_match('/^r\d+$/i', $args[0]) && ($args[1] ?? '') === 'title') {
+                $item = Store::roadmapItem($proj, $args[0]) ?? fail("unknown roadmap entry {$args[0]} on $proj");
+                $owns = $sid && Store::one('SELECT 1 FROM tasks t LEFT JOIN threads th ON th.id = t.thread_id WHERE t.roadmap_id = ? AND (t.session_id = ? OR th.session_id = ?)', [$item['id'], $sid, $sid]);
+                ($owns || !empty($session['is_master']) || !empty($session['is_developer'])) || fail("only the session that built r{$item['id']} or the master renames it");
+                $title = textArg(array_slice($args, 2)) ?: fail('usage: sb review rN title "the new title"');
+                try {
+                    Store::retitleEntry($proj, (int)$item['id'], $title, $session['name'] ?? 'a session');
+                } catch (RuntimeException $e) {
+                    fail($e->getMessage());
+                }
+                echo "r{$item['id']} is now \"" . Store::roadmapItem($proj, (string)$item['id'])['title'] . "\" (was \"{$item['title']}\").\n";
+                return 0;
+            }
+            if (isset($args[0]) && preg_match('/^r\d+$/i', $args[0])) {
+                $item = Store::roadmapItem($proj, $args[0]) ?? fail("unknown roadmap entry {$args[0]} on $proj");
+                $item['status'] === 'shipped' || fail("r{$item['id']} has not shipped, so there is nothing to review yet");
+                $steps = textArg(array_slice($args, 1)) ?: fail("usage: sb review rN - <<'EOF' (Where: line, then numbered steps through the real flow)");
+                $steps = preg_replace('/^\W*How the user tests it\W*:\s*/i', '', $steps);
+                if ($gap = Store::reviewStepsGap($steps)) fail($gap);
+                Store::exec('UPDATE roadmap SET review_steps = ?, review_drafted = 0, review = coalesce(review, ?), updated_at = ? WHERE id = ?', [$steps, 'ready', time(), $item['id']]);
+                Store::event($proj, $sid, $session['current_task'] ?? null, 'review', "r{$item['id']} test steps rewritten", ['item' => (int)$item['id']]);
+                echo "Test steps for r{$item['id']} saved.\n";
+                return 0;
+            }
+            $q = Store::reviewQueue($proj);
+            echo count($q) . " waiting for the user's review on $proj (Review page: " . Store::baseUrl() . "/$proj/review/)\n";
+            foreach ($q as $r) echo "  r{$r['id']} [{$r['review_urgency']}] {$r['title']}" . ($r['review_drafted'] ? '  (steps drafted by the developer)' : '') . "\n";
+            return 0;
+
+        case 'feedback':
+            $task = Store::task($args[0] ?? '') ?? fail('usage: sb feedback <task-id> "what needs fixing and why"');
+            Store::taskVisible($task, $project) || fail("{$task['id']} belongs to another project");
+            $text = trim(implode(' ', array_slice($args, 1))) ?: fail('feedback text required');
+            giveFeedback($task, $text, $session['name'] ?? 'user');
+            $owner = Store::one('SELECT * FROM sessions WHERE session_id = ?', [$task['session_id']]);
+            $reg = Store::registry()[$task['session_id']] ?? null;
+            echo "Feedback recorded on {$task['id']} (owner: " . ($owner['name'] ?? '?') . ', ' . ($reg && $reg['alive'] ? 'live' : 'closed') . ").\n";
+            echo $reg && $reg['alive']
+                ? "It will see it on its next prompt. To act now, SendMessage to \"" . (isset($reg['messagingSocketPath']) ? "uds:{$reg['messagingSocketPath']}" : $reg['name']) . "\".\n"
+                : "Owner session is closed. Resume it from the board, or `sb use {$task['id']}` in another session.\n";
+            return 0;
+
+        case 'show':
+            $id = $args[0] ?? ($session['current_task'] ?? null) ?? fail('usage: sb show <task-id>');
+            $t = Store::task($id) ?? fail("unknown task $id");
+            Store::taskVisible($t, $project) || fail("$id belongs to another project");
+            printTask($t);
+            return 0;
+
+        case 'board':
+            printBoard(need($project, NO_PROJECT), in_array('--all', $args, true));
+            return 0;
+
+        case 'master':
+            need($session, 'not inside a Claude session');
+            $on = ($args[0] ?? 'on') !== 'off';
+            if ($on) Store::exec('UPDATE sessions SET is_master = 0 WHERE project = ?', [$project]);
+            Store::exec('UPDATE sessions SET is_master = ? WHERE session_id = ?', [$on ? 1 : 0, $sid]);
+            Store::event($project, $sid, null, 'master', $on ? 'became master' : 'stepped down as master');
+            echo $on ? "This session is now the master for $project.\n" : "Master role cleared.\n";
+            return 0;
+
+        case 'developer':
+            // The developer is one session for every project, and it runs in the statusboard's own dir.
+            need($session, 'not inside a Claude session');
+            $on = ($args[0] ?? 'on') !== 'off';
+            if ($on && $project !== Store::BOARD_PROJECT) fail('the developer runs in ' . Store::boardDir() . ' (the statusboard project). Start it with `sb start-developer` or the board button.');
+            if ($on) Store::exec('UPDATE sessions SET is_developer = 0 WHERE is_developer = 1');
+            Store::exec('UPDATE sessions SET is_developer = ? WHERE session_id = ?', [$on ? 1 : 0, $sid]);
+            Store::event($project, $sid, null, 'developer', $on ? 'became the statusboard developer' : 'stepped down as developer');
+            echo $on ? 'This session is now the statusboard developer. Read ' . Store::protocol('developer') . ' and ' . Store::boardDir() . "/DEVELOPER.md if they are not in your context.\n" : "Developer role cleared.\n";
+            return 0;
+
+        case 'dev':
+            // A project's master hands statusboard work to the developer. The thread lives in the statusboard
+            // project; origin_project/origin_session remember whose master to report back to.
+            need($session, 'not inside a Claude session');
+            $title = trim($args[0] ?? '') ?: fail('usage: sb dev "thread title" "brief"  (brief may be - for stdin)');
+            $brief = textArg(array_slice($args, 1)) ?: fail('a brief is required: what to change on the board and why, and what done looks like');
+            $id = newThread(Store::BOARD_PROJECT, $title, $brief);
+            Store::exec('UPDATE threads SET origin_project = ?, origin_session = ? WHERE id = ?', [$project, $sid, $id]);
+            $d = Store::developer();
+            if ($d && $d['alive']) {
+                Store::exec('UPDATE sessions SET thread_id = ? WHERE session_id = ?', [$id, $d['session_id']]);
+                Store::setThread($id, ['session_id' => $d['session_id'], 'status' => 'active'], 'handed to the developer ' . $d['name']);
+                Store::event($project, $sid, null, 'thread', "#$id handed to the developer: $title", ['thread' => $id]);
+                echo "Thread #$id \"$title\" is on the developer ({$d['name']}). Now SendMessage \"" . Store::messageAddress($d) . "\" the brief, starting with \"#$id:\".\n";
+            } else {
+                $first = Store::threadBrief($id, $session['name'], $brief);
+                Store::openTerminal(Store::developerCommand($d['session_id'] ?? null, $first, $id));
+                Store::event($project, $sid, null, 'thread', "#$id started the developer: $title", ['thread' => $id]);
+                echo "Thread #$id \"$title\": no developer was running, so " . ($d ? "the last one ({$d['name']}) is being resumed" : 'a new developer session is starting') . " with the brief. It binds to the thread when it starts.\n";
+            }
+            return 0;
+
+        case 'threads':
+            printThreads(need($project, NO_PROJECT), in_array('--all', $args, true));
+            return 0;
+
+        case 'spawn':
+            need($session, 'not inside a Claude session');
+            [$args, $model] = modelOpt($args);
+            // --main: a small fix straight on main, no worktree or database of its own.
+            $onMain = ($i = array_search('--main', $args, true)) !== false;
+            if ($onMain) array_splice($args, $i, 1);
+            $onMain && empty(Store::project($project)['worktree']) && fail("--main is for projects with thread worktrees: every thread in $project already works in its own tree. Run it without --main.");
+            // Checked before the thread exists, so a refusal leaves no thread without a session.
+            if (!$onMain && !empty(Store::project($project)['worktree']) && ($why = Store::diskGate($project, false))) fail($why);
+            $title = trim($args[0] ?? '') ?: fail('usage: sb spawn "thread title" "brief for the new session" [--main] [--model fable|opus|claude-...]  (brief may be - for stdin)');
+            $brief = textArg(array_slice($args, 1)) ?: fail('a brief is required: the goal, the context it lacks, constraints');
+            $id = newThread($project, $title, $brief);
+            $model = $model ?: null;
+            if ($model) Store::exec('UPDATE threads SET model = ? WHERE id = ?', [$model, $id]);
+            if ($onMain) Store::exec('UPDATE threads SET on_main = 1 WHERE id = ?', [$id]);
+            Store::spawnForThread($id, Store::threadBrief($id, $session['name'], $brief));
+            Store::event($project, $sid, null, 'thread', "#$id spawned a new session: $title" . ($model ? " (on $model)" : '') . ($onMain ? ' (on main)' : ''), ['thread' => $id]);
+            echo "Thread #$id \"$title\" created and a new Terminal session is starting (named \"#$id ...\") on " . modelLabel($model)
+                . ($onMain ? ', directly on main in ' . Store::project($project)['cwd'] . ' (no worktree, no database of its own)' : '') . ". It binds itself to the thread when it starts; `sb threads` shows it.\n";
+            return 0;
+
+        case 'assign':
+            $n = (int)($args[0] ?? 0);
+            $target = $args[1] ?? fail('usage: sb assign <thread#|new> <session name> ["title" if new]');
+            need($project, NO_PROJECT);
+            $to = resolveSession($target, $project) ?? fail("no session called $target in this project ($project)");
+            if (($args[0] ?? '') === 'new') {
+                $title = trim(implode(' ', array_slice($args, 2))) ?: fail('a new thread needs a title');
+                $n = newThread($project, $title, null);
+            }
+            $t = Store::thread($n) ?? fail("unknown thread #$n");
+            $t['project'] === $project || fail("thread #$n belongs to another project ({$t['project']})");
+            Store::exec('UPDATE sessions SET thread_id = NULL WHERE thread_id = ?', [$n]);
+            Store::exec('UPDATE sessions SET thread_id = ? WHERE session_id = ?', [$n, $to['session_id']]);
+            Store::setThread($n, ['session_id' => $to['session_id'], 'status' => 'active'], 'assigned to ' . ($to['title'] ?? $to['name']));
+            echo "Thread #$n \"{$t['title']}\" -> {$to['name']} (" . ($to['title'] ?? 'untitled') . "). Now SendMessage \"" . Store::messageAddress($to) . "\" the brief, starting with \"#$n:\". It reports back to your address (its hook context names it).\n";
+            return 0;
+
+        case 'thread':
+            $n = (int)($args[0] ?? 0) ?: fail('usage: sb thread <n> [archive | status <status> | note "text" | model fable|opus|default]');
+            $t = Store::thread($n) ?? fail("unknown thread #$n");
+            Store::threadVisible($t, $project) || fail("thread #$n belongs to another project");
+            $sub = $args[1] ?? null;
+            if ($sub === 'model') {
+                $model = Store::normalizeModel($args[2] ?? fail('usage: sb thread <n> model fable|opus|default|claude-...'));
+                Store::setThread($n, ['model' => $model], 'model set to ' . modelLabel($model) . ' for its next session');
+                echo "Thread #$n runs on " . modelLabel($model) . " from its next session (`sb respawn $n`). Its current session keeps its model.\n";
+                return 0;
+            }
+            if ($sub === 'archive') {
+                Store::setThread($n, ['status' => 'archived'], 'archived (approved by the user)', 'thread_status');
+                echo "Thread #$n archived.\n";
+            } elseif ($sub === 'status') {
+                $st = $args[2] ?? '';
+                in_array($st, Store::THREAD_STATUSES, true) || fail('status: ' . implode('|', Store::THREAD_STATUSES));
+                Store::setThread($n, ['status' => $st], $st . (isset($args[3]) ? ': ' . implode(' ', array_slice($args, 3)) : ''), 'thread_status');
+                echo "Thread #$n -> $st.\n";
+            } elseif ($sub === 'note') {
+                Store::setThread($n, ['note' => implode(' ', array_slice($args, 2))], implode(' ', array_slice($args, 2)));
+                echo "Noted on #$n.\n";
+            } else {
+                printThread($t);
+            }
+            return 0;
+
+        case 'ask':
+            need($session, 'not inside a Claude session');
+            $q = textArg($args) ?: fail('usage: sb ask "what you need from the user"');
+            $n = (int)$session['thread_id'];
+            // Marks this session's next reply as a question for the user (the board shows "Your turn").
+            Store::exec('UPDATE sessions SET asked_at = ? WHERE session_id = ?', [time(), $sid]);
+            if ($session['current_task']) {
+                Store::touchTask($session['current_task'], ['status' => 'waiting_user']);
+                Store::event($project, $sid, $session['current_task'], 'waiting', $q);
+            }
+            if ($n) {
+                Store::setThread($n, ['status' => 'waiting_user'], "needs the user: $q", 'thread_status');
+                echo "Thread #$n is waiting on the user. Also SendMessage the master: \"#$n: <your question>\".\n";
+            } else {
+                echo "Recorded: the board shows your next reply as \"your turn\". Ask the question in that reply.\n";
+            }
+            return 0;
+
+        case 'clear':
+            $to = resolveSession($args[0] ?? '', need($project, NO_PROJECT)) ?? fail("usage: sb clear <session name> [--force] (a session of this project, $project)");
+            $why = Store::clearSession($to['session_id'], in_array('--force', $args, true));
+            if ($why) fail("not clearing {$to['name']}: $why");
+            echo "Sent /clear to {$to['name']}. Its thread and task records stay on the board.\n";
+            return 0;
+
+        case 'archive':
+            // The master closes a worker that finished and was approved: archived on the board, process and terminal closed.
+            ($session['is_master'] ?? false) || fail('only the master archives sessions (the user can, from the board)');
+            $to = resolveSession($args[0] ?? '', need($project, NO_PROJECT)) ?? fail("usage: sb archive <session name> (a session of this project, $project)");
+            if ($why = Store::archiveBlock($to)) fail("not archiving {$to['name']}: $why. Only finished, approved work is archived.");
+            Store::exec('UPDATE sessions SET archived_at = ?, close_on_stop = 0 WHERE session_id = ?', [time(), $to['session_id']]);
+            Store::event($project, $to['session_id'], null, 'archived', "by the master ({$session['name']})");
+            $res = Store::closeSession($to['session_id']);
+            echo "Archived {$to['name']}: " . ['closed' => 'its process stopped and its terminal closed.', 'closing' => 'it is still working, so it closes when this turn ends.', 'not open' => 'it was not running.'][$res] . " The conversation can be resumed from the board.\n";
+            return 0;
+
+        case 'respawn':
+            need($session, 'not inside a Claude session');
+            [$args, $model] = modelOpt($args);
+            $n = (int)($args[0] ?? 0) ?: fail('usage: sb respawn <thread#> [--model fable|opus|claude-...]  (fresh session continuing the thread, on its model unless given)');
+            $t = Store::thread($n) ?? fail("unknown thread #$n");
+            $t['project'] === $project || fail("thread #$n belongs to another project ({$t['project']})" . ($t['origin_project'] === $project ? '; statusboard threads go to the developer' : ''));
+            if ($model !== false) Store::exec('UPDATE threads SET model = ? WHERE id = ?', [$model, $n]);
+            Store::spawnForThread($n, Store::threadBrief($n, $session['name'], Store::respawnBrief($n)));
+            Store::setThread($n, ['status' => 'active'], 'fresh session requested (context reset)');
+            $old = $t['session_id'] ? Store::one('SELECT name FROM sessions WHERE session_id = ?', [$t['session_id']]) : null;
+            echo "Fresh session for #$n is starting on " . modelLabel(Store::thread($n)['model']) . '. ' . ($old ? "Tell the user the old one ({$old['name']}) can be closed." : '') . "\n";
+            return 0;
+
+        case 'start-master':
+            // Runs in the user's own terminal: replaces this process with a master claude session.
+            $project ??= Store::projectForCwd(getcwd()) ?? fail('run this inside a project that has a board (see ' . Store::baseUrl() . '/)');
+            $m = Store::master($project);
+            $resume = in_array('--resume', $args, true);
+            if ($m && $m['alive'] && !in_array('--force', $args, true)) {
+                fail("a master is already running ({$m['name']}, " . ($m['title'] ?? 'untitled') . "). Use the board's Show terminal, or --force to start another.");
+            }
+            if ($resume && !$m) fail('no previous master to resume; run `sb start-master` without --resume');
+            $cmd = Store::masterCommand($project, $resume ? $m['session_id'] : null);
+            echo "Starting master: $cmd\n";
+            pcntl_exec(getenv('SHELL') ?: '/bin/zsh', ['-lc', $cmd]);
+            fail('could not start claude');
+
+        case 'start-developer':
+            // Runs in the user's own terminal: replaces this process with a developer claude session.
+            $d = Store::developer();
+            $resume = in_array('--resume', $args, true);
+            if ($d && $d['alive'] && !in_array('--force', $args, true)) {
+                fail("a developer is already running ({$d['name']}, " . ($d['title'] ?? 'untitled') . "). Use the board's Show terminal, or --force to start another.");
+            }
+            if ($resume && !$d) fail('no previous developer to resume; run `sb start-developer` without --resume');
+            $cmd = Store::developerCommand($resume ? $d['session_id'] : null);
+            echo "Starting developer: $cmd\n";
+            pcntl_exec(getenv('SHELL') ?: '/bin/zsh', ['-lc', $cmd]);
+            fail('could not start claude');
+
+        case 'serve':
+            // The board on PHP's built-in server: no nginx or Apache needed. base_url must point at it.
+            $url = parse_url(Store::baseUrl());
+            $port = (int)($args[0] ?? ($url['port'] ?? 8787));
+            $host = $url['host'] ?? '127.0.0.1';
+            echo "Statusboard on http://$host:$port" . ($url['path'] ?? '') . "/  (Ctrl+C stops it)\n";
+            if (($url['scheme'] ?? '') !== 'http' || ($url['port'] ?? null) !== $port) {
+                echo "Note: base_url in config.local.php is " . Store::baseUrl() . "; links and `sb pair` use that.\n";
+            }
+            pcntl_exec(PHP_BINARY, ['-S', "$host:$port", '-t', Store::boardDir(), Store::boardDir() . '/app/router.php']);
+            fail('could not start php -S');
+
+        case 'update':
+            // Merges the newest upstream/main (the public repo) into this checkout, then migrates and rewrites the entry points.
+            // git refuses unrelated histories, so a checkout that is not a clone of upstream never takes it in by accident.
+            $dir = Store::boardDir();
+            $git = function (string $cmd) use ($dir): array {
+                exec('git -C ' . escapeshellarg($dir) . " $cmd 2>&1", $out, $code);
+                return [$code, trim(implode("\n", $out))];
+            };
+            if ($git('rev-parse --git-dir')[0]) fail("$dir is not a git checkout.");
+            if ($git('remote get-url upstream')[0]) {
+                fail("this checkout has no `upstream` remote. Add the public repo once:\n"
+                    . "  git -C $dir remote add upstream https://github.com/admiralshoi/claude-statusboard.git\n"
+                    . "  git -C $dir remote set-url --push upstream DISABLED");
+            }
+            [, $dirty] = $git('status --porcelain --untracked-files=no');
+            if ($dirty !== '') fail("uncommitted changes in $dir. Commit them first (they are yours to keep), then run `sb update` again:\n$dirty");
+            echo "Fetching upstream...\n";
+            [$code, $out] = $git('fetch upstream');
+            if ($code) fail("git fetch upstream failed:\n$out");
+            [$code, $out] = $git('merge --no-edit upstream/main');
+            if ($code && str_contains($out, 'unrelated histories')) fail("upstream shares no history with this checkout (it is not a clone of it), so nothing was merged. Check `git -C $dir remote -v`.");
+            if ($code) fail("the merge stopped:\n$out\nResolve it (the developer session can), or `git -C $dir merge --abort` to go back.");
+            echo "$out\n";
+            // A new process, so the migration runs the merged code rather than the copy loaded here.
+            passthru(escapeshellarg(PHP_BINARY) . ' ' . escapeshellarg("$dir/bin/sb") . ' setup', $code);
+            if ($code) fail('the merge went in, but `sb setup` failed: see above.');
+            echo "Updated. Push it to your own repo with `git push`, and reload the boards.\n";
+            return 0;
+
+        case 'setup':
+            // install.sh runs this: the data dir, the DB schema, the pairing secret and every board's entry points.
+            Store::db();
+            Store::boardToken();
+            foreach (array_keys(Store::projects(true)) as $key) Store::writeEntryPoints($key);
+            echo 'Data in ' . Store::dataDir() . ', ' . count(Store::projects()) . " board(s) set up.\n";
+            return 0;
+
+        case 'install-hooks':
+            // Run by the user (install.sh does it for the statusboard's own dir): the same as the index's Install hooks.
+            $root = realpath($args[0] ?? '') ?: fail('usage: sb install-hooks <project root>');
+            foreach (Store::installProjectFiles($root) as $line) echo "- $line\n";
+            return 0;
+
+        case 'protocols':
+            foreach (Store::PROTOCOLS as $p) printf("%-13s %s\n", $p, Store::protocol($p));
+            return 0;
+
+        case 'whoami':
+            if (!$session) { echo "Not inside a Claude session.\n"; return 1; }
+            echo "{$session['name']} session={$sid} project={$project}" . ($session['is_master'] ? ' MASTER' : '') . ($session['is_developer'] ? ' DEVELOPER' : '') . "\n";
+            echo 'current task: ' . ($session['current_task'] ?: 'none') . "\n";
+            return 0;
+
+        default:
+            $base = Store::baseUrl();
+            echo <<<TXT
+            sb - statusboard (protocols: `sb protocols`; boards: $base/, this project's: $base/<project>/)
+
+              sb new "title"              start a work task, prints its id (becomes current)
+              sb side "title"             log a side task (no maps needed)
+              sb analysis "md"            map 1: what the request means, unknowns, what to inspect
+              sb solution "md"            map 2: approach, risks, how it will be verified
+              sb steps "a" "b" ...        the task list (replaces it)
+              sb step N doing|done|skip|waiting|blocked ["note"]
+              sb note "text"              a finding or decision worth keeping
+              sb status working|waiting_user|blocked|review ["why"]
+              sb ask "what you need"      the task waits for the user (not blocked)
+              sb tier T0|T1|T2|T3 "why"   risk tier (verification protocol, see `sb protocols`)
+              sb check pass|fail|reasoned|skip "what" "evidence"   log a verification check
+              sb verify -                 the verification report for a report or lookup (T0)
+              sb log [--ongoing] -        built work: its roadmap entry, before handoff (Title / Kind / Area / What changed / Why / How the user tests it / Fixed / Urgency / Details)
+              sb log --none "why"         built work that must never reach the review queue (test-only integration, a deploy run): no entry, reason kept
+              sb review [rN -]            the user's review queue; rN - rewrites that entry's test steps
+              sb review fold rA.. --into rC  older entries a newer one on the same branch replaces: out of the queue, reviewed and merged with rC
+              sb review unfold rA         back in the queue on its own
+              sb review rN title "..."    rename an entry (its builder or the master), e.g. a fold target that now covers more
+              sb worktree [merge rN|prune] thread worktrees here; merge retries a Reviewed OK merge; prune removes merged ones reviewed OK
+              sb disk [measure|allow]     free space vs the next worktree copy; new worktrees wait when low (allow: the user only)
+              sb live [N|off [project]]   run thread N at the project's real local URL, on a fresh copy of main's database, and back; no arguments: the state
+              sb live set N name=value... the settings thread N needs to be testable (unset N name removes one); set on the copy at every run
+              sb synced <target> start|ok|failed [--dry] [--migrate] [--note txt]   a deploy script reports a sync to a remote box
+              sb validation-resume [<round id>]   run a validator round paused by a usage limit now (no id: every round whose reset has passed)
+              sb todo add "what" --when "testing deploy" [--date YYYY-MM-DD] [--owner master|#n|me] [--detail ..] [--steps ..]   a reminder for later
+              sb todo list [--all] | done <id> ["note"] | fire <event>   events: testing-deploy, prod-deploy, merge, merge-<thread#>, any slug
+              sb syncs [target NAME "label"]   reported syncs of this project; target shows a box on the board before its first report
+              sb handoff -                built work: hand it to the independent validator (Asked / Built / Why it resolves it / How to test / Risks)
+              sb done "summary"           close (refused until verified; --unverified "why" to override)
+              sb abandon "why"
+              sb use <id> | reopen <id> "why"    pick up an existing task
+              sb feedback <id> "text"     request a fix on a task (master / user)
+              sb show [id]                full task record
+              sb board [--all]            sessions + open tasks (for the master)
+              sb ask "question"           (thread session) mark the thread as waiting on the user
+
+            roadmap ($base/<project>/roadmap/):
+              sb roadmap [planned|shipped|all] [text]   list entries (default: planned)
+              sb roadmap rN [drop "why"]  one entry in full, or drop planned work
+              sb plan [rN] -              plan work for later (Title / Kind / Area / Priority / What / Why / Details), or re-plan rN
+              sb pick rN                  the current task takes on planned item rN; its `sb log` ships that entry
+
+            master:
+              sb threads [--all]          tracked lines of work: session, status, clear advice
+              sb spawn "title" "brief" [--main] [--model fable|opus]   new thread + new Terminal session working on it (default: newest Opus; --main: on main, no worktree)
+              sb assign <n> <session>     put a thread on an existing session (sb assign new <session> "title")
+              sb thread <n> [archive | status <s> | note "text" | model fable|opus|default]
+              sb respawn <n> [--model ..]  fresh session continuing a thread, on its model
+              sb clear <session> [--force]  type /clear into a session (only if idle, no open task, no thread waiting)
+              sb archive <session>        close a finished worker for good (its thread approved, no open task): archived, process and terminal closed
+              sb master [off]             mark this session as the master
+              sb start-master [--resume]  (in a plain terminal) start a new master session, or resume the last one
+              sb dev "title" "brief"      hand statusboard work to the developer (starts one if none is running)
+              sb developer [off]          mark this session as the statusboard developer
+              sb start-developer [--resume]  (in a plain terminal) start the developer, or resume the last one
+              sb whoami
+              sb pair [--print]           pair this browser with the board (its buttons need it)
+              sb protocols                where the protocols live (served from the statusboard)
+              sb serve [port]             serve the board with PHP's built-in server (no nginx needed)
+              sb update                   merge the newest upstream/main into this checkout, then migrate (commit your changes first)
+
+            Long text can be piped on stdin: sb analysis - <<'EOF' ... EOF
+            TXT;
+            echo "\n";
+            return 0;
+    }
+}
+
+/** Takes `--model X` out of $args: [the rest, the normalized model (null = default), or false when not given]. */
+function modelOpt(array $args): array {
+    $i = array_search('--model', $args, true);
+    if ($i === false) return [$args, false];
+    $model = Store::normalizeModel($args[$i + 1] ?? fail('--model needs fable, opus, default or a claude-... id'));
+    array_splice($args, $i, 2);
+    return [$args, $model];
+}
+
+/** "Fable (falls back to Opus)", "Opus (default)": what a thread's sessions start on. */
+function modelLabel(?string $model): string {
+    $m = $model ?? (Store::config()['default_model'] ?? null);
+    if (!$m) return 'the default model';
+    $label = Store::config()['models'][Store::modelFamily($m)] ?? $m;
+    if ($m !== Store::modelFamily($m) && isset(Store::config()['models'][Store::modelFamily($m)])) $label .= " ($m)";
+    $fb = (Store::config()['credit_fallback'] ?? [])[Store::modelFamily($m)] ?? null;
+    return $label . ($model === null ? ' (default)' : '') . ($fb ? ' (falls back to ' . (Store::config()['models'][$fb] ?? $fb) . ')' : '');
+}
+
+function newThread(string $project, string $title, ?string $brief): int {
+    Store::exec('INSERT INTO threads (project, title, status, brief, created_at, updated_at) VALUES (?,?,?,?,?,?)', [$project, $title, 'active', $brief, time(), time()]);
+    return (int)Store::db()->lastInsertId();
+}
+
+/** A session of $project by name, id or title. Sessions of other projects are never found. */
+function resolveSession(string $ref, string $project): ?array {
+    $ref = trim($ref);
+    foreach (Store::registry() as $sid => $r) {
+        if ((($r['name'] ?? '') === $ref || $sid === $ref) && Store::projectForCwd($r['cwd'] ?? null) === $project) return ensureRow($sid, $r);
+    }
+    return Store::one('SELECT * FROM sessions WHERE project = ? AND (name = ? OR session_id = ? OR title = ?) ORDER BY last_seen DESC', [$project, $ref, $ref, $ref]);
+}
+
+function ensureRow(string $sid, array $r): array {
+    Store::exec('INSERT OR IGNORE INTO sessions (session_id, project, pid, cwd, name, started_at, last_seen) VALUES (?,?,?,?,?,?,?)',
+        [$sid, Store::projectForCwd($r['cwd'] ?? null), $r['pid'], $r['cwd'] ?? null, $r['name'] ?? null, (int)($r['startedAt'] / 1000), time()]);
+    return Store::one('SELECT * FROM sessions WHERE session_id = ?', [$sid]);
+}
+
+function printThreads(string $project, bool $all): void {
+    $reg = Store::registry();
+    $where = $all ? '' : "AND status != 'archived'";
+    // Its own threads, plus the statusboard threads its master handed to the developer.
+    $rows = Store::all("SELECT * FROM threads WHERE (project = ? OR origin_project = ?) $where ORDER BY CASE status WHEN 'waiting_user' THEN 0 WHEN 'needs_approval' THEN 1 WHEN 'active' THEN 2 ELSE 3 END, updated_at DESC", [$project, $project]);
+    if (!$rows) { echo "No threads. Start one with `sb spawn` or `sb assign new <session> \"title\"`.\n"; return; }
+    foreach ($rows as $t) {
+        if ($t['project'] !== $project) $t['title'] = '[statusboard] ' . $t['title'];
+        $s = $t['session_id'] ? Store::one('SELECT * FROM sessions WHERE session_id = ?', [$t['session_id']]) : null;
+        $live = $s && ($reg[$s['session_id']]['alive'] ?? false);
+        $task = $s && $s['current_task'] ? Store::task($s['current_task']) : null;
+        $adv = $s ? Store::clearAdvice($s, $task) : null;
+        printf("#%-3d %-15s %-40s %s\n", $t['id'], $t['status'], mb_strimwidth($t['title'], 0, 40, '..'),
+            $s ? ($s['name'] . ($live ? ' (' . ($reg[$s['session_id']]['status'] ?? 'live') . ')' : ' (closed)') . (($st = Store::displayTitle($s)) ? ' "' . mb_strimwidth($st, 0, 35, '..') . '"' : '')) : 'no session yet');
+        if ($task) echo "     task {$task['id']} [{$task['status']}] {$task['title']}\n";
+        if ($adv && $adv['level'] !== 'none') echo "     clear: {$adv['level']} - {$adv['reason']}\n";
+    }
+}
+
+function printThread(array $t): void {
+    echo "#{$t['id']} [{$t['status']}] {$t['title']}\n";
+    $s = $t['session_id'] ? Store::one('SELECT * FROM sessions WHERE session_id = ?', [$t['session_id']]) : null;
+    echo 'session: ' . ($s ? "{$s['name']} \"" . Store::displayTitle($s) . '"' : 'none yet') . '   created ' . ago($t['created_at']) . '   updated ' . ago($t['updated_at']) . "\n";
+    if ($t['brief']) echo "\n## Brief\n{$t['brief']}\n";
+    $tasks = Store::all('SELECT * FROM tasks WHERE thread_id = ? ORDER BY created_at', [$t['id']]);
+    if ($tasks) {
+        echo "\n## Tasks\n";
+        foreach ($tasks as $x) echo "  {$x['id']} [{$x['status']}] {$x['title']}" . ($x['summary'] ? "\n      " . mb_strimwidth($x['summary'], 0, 300, '..') : '') . "\n";
+    }
+    $ev = Store::all("SELECT * FROM events WHERE meta LIKE ? ORDER BY id DESC LIMIT 15", ['%"thread":' . $t['id'] . '}%']);
+    if ($ev) {
+        echo "\n## Recent (newest first)\n";
+        foreach ($ev as $e) echo '  ' . date('m-d H:i', $e['ts']) . " {$e['type']}: " . mb_strimwidth((string)$e['body'], 0, 300, '..') . "\n";
+    }
+}
+
+function giveFeedback(array $task, string $text, string $from): void {
+    Store::touchTask($task['id'], ['status' => 'changes_requested', 'pending_feedback' => 1, 'closed_at' => null]);
+    Store::event($task['project'], $task['session_id'], $task['id'], 'feedback', $text, ['from' => $from]);
+}
+
+function need($v, string $msg) { return $v ?: fail($msg); }
+
+function fail(string $msg): never { throw new RuntimeException($msg); }
+
+function textArg(array $args): string {
+    $text = trim(implode(' ', $args));
+    if ($text === '-') $text = trim((string)stream_get_contents(STDIN));
+    return $text;
+}
+
+function currentTask(?array $session): array {
+    need($session, 'not inside a Claude session');
+    $id = $session['current_task'] ?: fail('no current task. Start one with `sb new "title"` or pick one up with `sb use <id>`');
+    return Store::task($id) ?? fail("current task $id not found");
+}
+
+function ago(?int $ts): string {
+    if (!$ts) return '-';
+    $d = time() - $ts;
+    return match (true) {
+        $d < 60 => "{$d}s ago",
+        $d < 3600 => intdiv($d, 60) . 'm ago',
+        $d < 86400 => intdiv($d, 3600) . 'h ago',
+        default => intdiv($d, 86400) . 'd ago',
+    };
+}
+
+function printRoadmapItem(array $r): void {
+    $tasks = Store::all('SELECT id, status, title FROM tasks WHERE roadmap_id = ? ORDER BY created_at', [$r['id']]);
+    echo "r{$r['id']}  [{$r['status']}]  {$r['kind']}  {$r['area']}  {$r['title']}\n";
+    echo 'by ' . ($r['created_by'] ?? '?') . '   created ' . ago($r['created_at']) . ($r['shipped_at'] ? '   shipped ' . ago($r['shipped_at']) : '') . ($r['priority'] ? "   priority {$r['priority']}" : '') . "\n";
+    foreach (['What' => 'summary', 'Why' => 'why', 'Fixed' => 'fixed', 'Details' => 'details'] as $label => $col) {
+        if ($r[$col]) echo "\n$label:\n{$r[$col]}\n";
+    }
+    if ($tasks) echo "\nTasks: " . implode(', ', array_map(fn($t) => "{$t['id']} ({$t['status']})", $tasks)) . "\n";
+}
+
+function printTask(array $t): void {
+    echo Store::taskText($t);
+}
+
+function printBoard(string $project, bool $all): void {
+    $reg = Store::registry();
+    echo "== Sessions ($project) ==\n";
+    if ($project !== Store::BOARD_PROJECT) {
+        $d = Store::developer();
+        echo '  Developer (all projects): ' . ($d ? $d['name'] . ($d['alive'] ? ' (live)' : ' (closed)') : 'none') . ". Statusboard work goes there with `sb dev`.\n";
+    }
+    $known = Store::all('SELECT * FROM sessions WHERE project = ? ORDER BY last_seen DESC', [$project]);
+    $seen = [];
+    foreach ($known as $s) {
+        $r = $reg[$s['session_id']] ?? null;
+        $live = $r && $r['alive'];
+        if (!$live && !$all) continue;
+        $seen[$s['session_id']] = true;
+        $task = $s['current_task'] ? Store::task($s['current_task']) : null;
+        $adv = Store::clearAdvice($s, $task);
+        $win = Store::contextWindow($s['model'], (int)$s['ctx_tokens']);
+        printf("  %-18s %-40s %-6s ctx %3d%%  last %-8s  %s%s\n",
+            $r['name'] ?? $s['name'] ?? substr($s['session_id'], 0, 8),
+            mb_strimwidth((string)Store::displayTitle($s), 0, 40, '..'),
+            $live ? ($r['status'] ?? 'live') : 'closed',
+            $win ? round($s['ctx_tokens'] / $win * 100) : 0,
+            ago($s['last_seen']),
+            $task ? "{$task['id']} [{$task['status']}] {$task['title']}" : 'no task',
+            ($s['is_master'] ? '  (MASTER)' : '') . ($s['is_developer'] ? '  (DEVELOPER: statusboard work goes here, `sb dev`)' : '') . ($s['thread_id'] ? "  thread #{$s['thread_id']}" : ''));
+        if ($adv['level'] !== 'none') echo "      clear: {$adv['level']} - {$adv['reason']}\n";
+    }
+    foreach ($reg as $sid => $r) {
+        if (isset($seen[$sid]) || !$r['alive'] || Store::projectForCwd($r['cwd'] ?? null) !== $project) continue;
+        printf("  %-18s %-6s not reporting yet (no hook event since the board was installed)\n", $r['name'] ?? $sid, $r['status'] ?? 'live');
+    }
+    echo "\n== Threads ==\n";
+    printThreads($project, false);
+    echo "\n== Open tasks ==\n";
+    $open = implode(',', array_map(fn($s) => "'$s'", Store::OPEN_STATUSES));
+    foreach (Store::all("SELECT t.*, s.name FROM tasks t LEFT JOIN sessions s USING(session_id) WHERE t.project = ? AND t.status IN ($open) ORDER BY t.updated_at DESC", [$project]) as $t) {
+        $steps = Store::steps($t['id']);
+        $done = count(array_filter($steps, fn($s) => in_array($s['status'], ['done', 'skip'], true)));
+        printf("  %-7s %-17s %-18s %s/%s steps  %-8s %s\n", $t['id'], $t['status'], $t['name'] ?? '?', $done, count($steps), ago($t['updated_at']), $t['title']);
+    }
+    echo "\n== Recently closed ==\n";
+    foreach (Store::all("SELECT t.*, s.name FROM tasks t LEFT JOIN sessions s USING(session_id) WHERE t.project = ? AND t.status IN ('done','abandoned') ORDER BY t.closed_at DESC LIMIT 8", [$project]) as $t) {
+        printf("  %-7s %-9s %-18s %-8s %s\n", $t['id'], $t['status'], $t['name'] ?? '?', ago($t['closed_at']), $t['title']);
+    }
+}
+
+/* =====================================================================
+ * Session bookkeeping
+ * ===================================================================== */
+
+function ensureSession(string $sid, array $hook = []): array {
+    $s = Store::one('SELECT * FROM sessions WHERE session_id = ?', [$sid]);
+    $pid = Store::claudePid();
+    $reg = $pid ? @json_decode((string)@file_get_contents(Store::home() . "/.claude/sessions/$pid.json"), true) : null;
+    $cwd = $hook['cwd'] ?? $reg['cwd'] ?? getcwd();
+    $now = time();
+    if (!$s) {
+        Store::exec(
+            // OR IGNORE: two hooks of a fresh session can fire at once (a /clear plus an incoming message), and
+            // a UNIQUE failure here would abort SessionStart before it carries the master or developer role over.
+            'INSERT OR IGNORE INTO sessions (session_id, project, pid, cwd, transcript, name, started_at, last_seen) VALUES (?,?,?,?,?,?,?,?)',
+            [$sid, Store::projectForCwd($cwd), $pid, $cwd, $hook['transcript_path'] ?? null, $reg['name'] ?? null, $now, $now]
+        );
+    } else {
+        Store::exec(
+            'UPDATE sessions SET last_seen = ?, pid = COALESCE(?, pid), name = COALESCE(?, name), transcript = COALESCE(?, transcript), ended_at = NULL, end_reason = NULL WHERE session_id = ?',
+            [$now, $pid, $reg['name'] ?? null, $hook['transcript_path'] ?? null, $sid]
+        );
+    }
+    return Store::one('SELECT * FROM sessions WHERE session_id = ?', [$sid]);
+}
+
+/* =====================================================================
+ * Status line: Claude Code pipes session JSON in (incl. the plan's rate_limits), we print one line.
+ * The latest rate limits are account-wide, so whichever session refreshed last is the current truth.
+ * ===================================================================== */
+
+function statusline(): void {
+    $raw = (string)stream_get_contents(STDIN);
+    $in = json_decode($raw, true) ?: [];
+    $dir = Store::dataDir();
+    // Keep one raw sample so the board can adapt if field names change.
+    @file_put_contents("$dir/statusline-sample.json", $raw);
+
+    $windows = [];
+    foreach (($in['rate_limits'] ?? []) as $key => $w) {
+        if (!is_array($w) || !isset($w['used_percentage'])) continue;
+        $reset = $w['resets_at'] ?? null;
+        if (is_string($reset) && !is_numeric($reset)) $reset = strtotime($reset) ?: null;
+        elseif (is_numeric($reset)) $reset = $reset > 1e12 ? (int)($reset / 1000) : (int)$reset;
+        $windows[$key] = ['used' => (float)$w['used_percentage'], 'resets_at' => $reset];
+    }
+    if ($windows) {
+        $tmp = "$dir/usage.json.tmp";
+        file_put_contents($tmp, json_encode(['updated_at' => time(), 'session_id' => $in['session_id'] ?? null, 'windows' => $windows]));
+        rename($tmp, "$dir/usage.json");
+    }
+
+    $parts = [];
+    $ctx = $in['context_window']['used_percentage'] ?? null;
+    if ($ctx !== null) $parts[] = 'ctx ' . round((float)$ctx) . '%';
+    $label = ['five_hour' => '5h', 'seven_day' => 'week'];
+    foreach ($windows as $key => $w) {
+        if (!isset($label[$key])) continue;
+        $when = $w['resets_at'] ? ($w['resets_at'] - time() < 86400 ? date('H:i', $w['resets_at']) : date('D H:i', $w['resets_at'])) : '?';
+        $parts[] = "{$label[$key]} " . round($w['used']) . "% (resets $when)";
+    }
+    $sid = $in['session_id'] ?? null;
+    if ($sid && ($row = Store::one('SELECT current_task FROM sessions WHERE session_id = ?', [$sid])) && $row['current_task']) $parts[] = $row['current_task'];
+    echo implode(' · ', $parts), "\n";
+}
+
+/* =====================================================================
+ * Hooks
+ * ===================================================================== */
+
+function hook(string $event): void {
+    $in = json_decode((string)stream_get_contents(STDIN), true) ?: [];
+    if ($vid = getenv('SB_VALIDATION')) {
+        validatorHook($vid, $event, $in);
+        return;
+    }
+    if ($event === 'PreToolUse') return;
+    $sid = $in['session_id'] ?? null;
+    if (!$sid) return;
+    // Outside every board (a dir that was never set up, or whose board was deleted): leave no trace.
+    if (!Store::projectForCwd($in['cwd'] ?? getcwd()) && !Store::one('SELECT 1 FROM sessions WHERE session_id = ? AND project IS NOT NULL', [$sid])) return;
+    $s = ensureSession($sid, $in);
+    $project = $s['project'];
+
+    switch ($event) {
+        case 'SessionStart':
+            $source = $in['source'] ?? 'startup';
+            $set = ['start_source' => $source];
+            if (in_array($source, ['clear', 'compact'], true) || !$s['prev_session_id']) {
+                $prev = $s['pid'] ? Store::one('SELECT * FROM sessions WHERE pid = ? AND session_id != ? ORDER BY last_seen DESC', [$s['pid'], $sid]) : null;
+                if ($prev && $source === 'clear') {
+                    $set['prev_session_id'] = $prev['session_id'];
+                    $set['clears'] = $prev['clears'] + 1;
+                    // The terminal keeps its role across /clear: same thread, same master flag.
+                    if ($prev['thread_id']) {
+                        $set['thread_id'] = $prev['thread_id'];
+                        Store::exec('UPDATE threads SET session_id = ? WHERE id = ?', [$sid, $prev['thread_id']]);
+                        Store::exec('UPDATE sessions SET thread_id = NULL WHERE session_id = ?', [$prev['session_id']]);
+                    }
+                    if ($prev['is_master']) {
+                        $set['is_master'] = 1;
+                        Store::exec('UPDATE sessions SET is_master = 0 WHERE session_id = ?', [$prev['session_id']]);
+                    }
+                    if ($prev['is_developer']) {
+                        $set['is_developer'] = 1;
+                        Store::exec('UPDATE sessions SET is_developer = 0 WHERE session_id = ?', [$prev['session_id']]);
+                    }
+                    Store::exec("UPDATE sessions SET ended_at = COALESCE(ended_at, ?), end_reason = COALESCE(end_reason, 'clear') WHERE session_id = ?", [time(), $prev['session_id']]);
+                }
+            }
+            if ($source === 'compact') $set['compactions'] = $s['compactions'] + 1;
+            if (($n = (int)getenv('SB_THREAD')) && ($t = Store::thread($n))) {
+                // Spawned for a thread by the master: bind to it. SB_THREAD stays in the process, so a session the thread
+                // has since moved on from (sb respawn) must not take it back when it compacts or is resumed.
+                $claim = $source === 'startup' || !$t['session_id'] || $t['session_id'] === $sid;
+                $set['thread_id'] = $claim ? $n : null;
+                if ($claim && $t['session_id'] !== $sid) {
+                    Store::exec('UPDATE sessions SET thread_id = NULL WHERE thread_id = ? AND session_id != ?', [$n, $sid]);
+                    Store::setThread($n, ['session_id' => $sid, 'status' => 'active'], 'session started: ' . ($s['name'] ?? $sid));
+                }
+            }
+            if (getenv('SB_ROLE') === 'master' && $project) {
+                Store::exec('UPDATE sessions SET is_master = 0 WHERE project = ? AND session_id != ?', [$project, $sid]);
+                $set['is_master'] = 1;
+                if (!$s['is_master']) Store::event($project, $sid, null, 'master', 'started as master');
+            }
+            // One developer for all projects, and only in the statusboard's own dir.
+            if (getenv('SB_ROLE') === 'developer' && $project === Store::BOARD_PROJECT) {
+                Store::exec('UPDATE sessions SET is_developer = 0 WHERE is_developer = 1 AND session_id != ?', [$sid]);
+                $set['is_developer'] = 1;
+                if (!$s['is_developer']) Store::event($project, $sid, null, 'developer', 'started as the statusboard developer');
+            }
+            $cols = implode(', ', array_map(fn($k) => "$k = ?", array_keys($set)));
+            Store::exec("UPDATE sessions SET $cols WHERE session_id = ?", [...array_values($set), $sid]);
+            Store::event($project, $sid, $s['current_task'], 'session_start', $source);
+            if ($project) out('SessionStart', startContext(Store::one('SELECT * FROM sessions WHERE session_id = ?', [$sid]), $source));
+            return;
+
+        case 'UserPromptSubmit':
+            $prompt = (string)($in['prompt'] ?? '');
+            $side = (bool)preg_match('#^\s*/sidetask\b#i', $prompt);
+            Store::exec(
+                // A new prompt means the session is in use again, so it is no longer parked.
+                'UPDATE sessions SET turns = turns + 1, turn_started_at = ?, turn_side = ?, turn_untracked_edits = 0, last_prompt = ?, last_prompt_at = ?, parked_at = NULL, archived_at = NULL WHERE session_id = ?',
+                [time(), $side ? 1 : 0, mb_substr($prompt, 0, 6000), time(), $sid]
+            );
+            Store::event($project, $sid, $s['current_task'], 'prompt', mb_substr($prompt, 0, 6000), $side ? ['side' => true] : []);
+            // It asked the user something (sb ask) and now gets a message (the user's reply from the terminal or
+            // the board, or the master relaying it): the question counts as answered and leaves "needs you".
+            if ($s['asked_at']) Store::closeQuestion($s, 'answered: the session got a reply');
+            if ($project) out('UserPromptSubmit', promptContext(Store::one('SELECT * FROM sessions WHERE session_id = ?', [$sid]), $side));
+            return;
+
+        case 'PostToolUse':
+            if (($in['tool_name'] ?? '') === 'SendMessage') {
+                logRelay($s, $in['tool_input'] ?? []);
+                return;
+            }
+            $path = $in['tool_input']['file_path'] ?? $in['tool_input']['notebook_path'] ?? null;
+            if (!$path) return;
+            $task = $s['current_task'] ? Store::task($s['current_task']) : null;
+            $tracked = Store::isOpen($task);
+            Store::exec('INSERT INTO files (ts, project, session_id, task_id, path, tool) VALUES (?,?,?,?,?,?)', [time(), $project, $sid, $tracked ? $task['id'] : null, $path, $in['tool_name'] ?? null]);
+            if (!$tracked && !$s['turn_side']) Store::exec('UPDATE sessions SET turn_untracked_edits = turn_untracked_edits + 1 WHERE session_id = ?', [$sid]);
+            $msg = (string)collisionWarning($sid, $path);
+            if (!$s['is_developer'] && str_starts_with((string)realpath(dirname($path)) . '/', Store::boardDir() . '/')) {
+                // The board's code belongs to the developer session; others only use it.
+                $msg = trim($msg . ' [statusboard] ' . $path . ' is statusboard code, which only the DEVELOPER session changes. Unless the user asked you directly to edit it, '
+                    . 'revert your change and hand it over instead (the master uses `sb dev`; or tell the user to send it to the developer).');
+            }
+            if ($msg !== '') out('PostToolUse', $msg);
+            return;
+
+        case 'StopFailure':
+            // The turn ended in an API error. A Fable session out of Fable's own usage goes to its fallback now, board open or not.
+            Store::scanTranscript($sid);
+            $s = Store::one('SELECT * FROM sessions WHERE session_id = ?', [$sid]);
+            $err = ['error' => (string)($in['error'] ?? ''), 'text' => implode(' ', array_unique(array_filter([trim((string)($in['error_details'] ?? '')), trim((string)($in['last_assistant_message'] ?? ''))])))];
+            if ($to = Store::modelFallbackFor($s['model'], $err)) Store::modelFallback($s, $s['model'], $to, $err);
+            Store::event($project, $sid, $s['current_task'], 'turn_failed', mb_substr(trim($err['error'] . ': ' . $err['text'], ': '), 0, 300));
+            return;
+
+        case 'Stop':
+            Store::scanTranscript($sid);
+            $s = Store::one('SELECT * FROM sessions WHERE session_id = ?', [$sid]);
+            Store::event($project, $sid, $s['current_task'], 'reply', mb_substr((string)$s['last_reply'], 0, 1500));
+            if ($s['close_on_stop'] && $s['archived_at']) {
+                // Archived while it was working: close it now that the turn is over (detached, so this hook returns first).
+                Store::exec('UPDATE sessions SET close_on_stop = 0 WHERE session_id = ?', [$sid]);
+                exec('PATH=' . escapeshellarg(Store::envPath()) . ' ' . escapeshellarg(Store::sbBin()) . ' close-session ' . escapeshellarg($sid) . ' > /dev/null 2>&1 &');
+                return;
+            }
+            if ($project && $s['turn_untracked_edits'] > 0 && empty($in['stop_hook_active'])) {
+                Store::exec('UPDATE sessions SET turn_untracked_edits = 0 WHERE session_id = ?', [$sid]);
+                echo json_encode([
+                    'decision' => 'block',
+                    'reason' => '[statusboard] You changed files this turn without an open statusboard task. Per ' . Store::protocol('session')
+                        . ': register it now (sb new "title", then a short sb analysis + sb solution + sb steps reflecting what you did, and sb done "summary" if it is finished, '
+                        . 'or `sb use <id>` if it belongs to an existing task). Then finish your reply and tell the user the task id.',
+                ]);
+            }
+            return;
+
+        case 'PreCompact':
+            Store::event($project, $sid, $s['current_task'], 'compact', $in['trigger'] ?? null);
+            return;
+
+        case 'SessionEnd':
+            Store::scanTranscript($sid);
+            Store::exec('UPDATE sessions SET ended_at = ?, end_reason = ? WHERE session_id = ?', [time(), $in['reason'] ?? 'other', $sid]);
+            Store::event($project, $sid, $s['current_task'], 'session_end', $in['reason'] ?? 'other');
+            return;
+    }
+}
+
+/** A SendMessage between the master and a thread session, logged on that thread. */
+function logRelay(array $from, array $input): void {
+    $ref = (string)($input['to'] ?? '');
+    // Relays stay inside a project; the one exception is the developer, who serves every project's master.
+    $to = resolveSession($ref, (string)$from['project']);
+    if (!$to) {
+        $other = null;
+        $pid = preg_match('#^uds:.*/(\d+)\.sock$#', $ref, $m) ? (int)$m[1] : null;
+        foreach (Store::registry() as $sid => $r) {
+            if (($r['name'] ?? '') === $ref || $sid === $ref || ($pid && (int)$r['pid'] === $pid)) $other = ensureRow($sid, $r);
+        }
+        if ($other && ($from['is_developer'] || $other['is_developer'])) $to = $other;
+    }
+    $msg = (string)($input['message'] ?? '');
+    if (!$to || $msg === '') return;
+    $thread = $from['is_master'] ? $to['thread_id'] : $from['thread_id'];
+    if (!$thread && preg_match('/^\s*#(\d+)\b/', $msg, $m) && Store::thread((int)$m[1])) $thread = (int)$m[1];
+    $dir = $from['is_master'] ? 'to ' . (Store::displayTitle($to) ?? $to['name']) : 'from ' . (Store::displayTitle($from) ?? $from['name']);
+    Store::event($from['project'], $from['session_id'], $from['current_task'], 'relay', "$dir: " . mb_substr($msg, 0, 4000),
+        $thread ? ['thread' => (int)$thread, 'to' => $to['session_id']] : ['to' => $to['session_id']]);
+    if ($thread) Store::exec('UPDATE threads SET updated_at = ? WHERE id = ?', [time(), $thread]);
+}
+
+function out(string $event, ?string $context): void {
+    if (!$context) return;
+    echo json_encode(['hookSpecificOutput' => ['hookEventName' => $event, 'additionalContext' => $context]]);
+}
+
+function taskLine(?array $t): string {
+    if (!$t) return 'none';
+    $steps = Store::steps($t['id']);
+    $done = count(array_filter($steps, fn($s) => in_array($s['status'], ['done', 'skip'], true)));
+    $maps = ($t['analysis_map'] ? 'A' : '-') . ($t['solution_map'] ? 'S' : '-');
+    return "{$t['id']} \"{$t['title']}\" [{$t['status']}, maps $maps, steps $done/" . count($steps) . ']';
+}
+
+/** Feedback written by the master/user since the owner last saw it, delivered once. */
+function pendingFeedback(string $sid): string {
+    $rows = Store::all('SELECT * FROM tasks WHERE session_id = ? AND pending_feedback = 1', [$sid]);
+    if (!$rows) return '';
+    $out = '';
+    foreach ($rows as $t) {
+        $fb = Store::all("SELECT body FROM events WHERE task_id = ? AND type = 'feedback' ORDER BY id DESC LIMIT 3", [$t['id']]);
+        $out .= "\nFIX REQUESTED on {$t['id']} \"{$t['title']}\": " . implode(' | ', array_column($fb, 'body'))
+            . " -> `sb use {$t['id']}`, address it, re-test, then `sb handoff` again (built work) or `sb done`.";
+        Store::exec('UPDATE tasks SET pending_feedback = 0 WHERE id = ?', [$t['id']]);
+    }
+    return $out;
+}
+
+function startContext(array $s, string $source): string {
+    $task = $s['current_task'] ? Store::task($s['current_task']) : null;
+    $ctx = "[statusboard] This project ({$s['project']}, board " . Store::baseUrl() . "/{$s['project']}/) runs the session protocol in " . Store::protocol('session')
+        . ' (read it now if it is not in your context; `sb protocols` lists all of them). '
+        . "You are {$s['name']}. Current task: " . taskLine($task) . '.';
+    if ($s['is_master']) $ctx .= ' You are the MASTER session of this project: follow ' . Store::protocol('master') . ' (read it now if it is not in your context) and start with `sb board`.';
+    if ($s['is_developer']) $ctx .= ' You are the statusboard DEVELOPER, for every project: you work only on the statusboard (' . Store::boardDir() . '). Follow ' . Store::protocol('developer')
+        . ' and read ' . Store::boardDir() . '/DEVELOPER.md now if they are not in your context: the architecture map and the working rules.';
+    if ($source === 'clear' && $s['prev_session_id']) {
+        $open = implode(',', array_map(fn($x) => "'$x'", Store::OPEN_STATUSES));
+        $left = Store::all("SELECT * FROM tasks WHERE session_id = ? AND status IN ($open)", [$s['prev_session_id']]);
+        if ($left) $ctx .= ' Before the /clear this terminal had open tasks: ' . implode('; ', array_map('taskLine', $left)) . '. If the user continues one, `sb use <id>`.';
+    }
+    if ($task && $source !== 'startup') $ctx .= " Run `sb show {$task['id']}` to reload its maps and steps before continuing.";
+    return $ctx . pendingFeedback($s['session_id']) . todoReminder($s);
+}
+
+function promptContext(array $s, bool $side): string {
+    $task = $s['current_task'] ? Store::task($s['current_task']) : null;
+    if ($side) {
+        return '[statusboard] SIDE TASK (/sidetask): answer or investigate without the task protocol, no maps needed. '
+            . 'Do not change project files; if it turns into real work, stop and tell the user so it can become a task.' . pendingFeedback($s['session_id']);
+    }
+    $role = '';
+    if ($s['is_master']) {
+        $counts = Store::all("SELECT status, COUNT(*) n FROM threads WHERE project = ? AND status != 'archived' GROUP BY status", [$s['project']]);
+        $c = array_column($counts, 'n', 'status');
+        $role = ' (MASTER of ' . $s['project'] . ': ' . Store::protocol('master') . '. Threads: ' . ($c['active'] ?? 0) . ' active, ' . ($c['waiting_user'] ?? 0) . ' waiting on the user, '
+            . ($c['needs_approval'] ?? 0) . ' awaiting approval. Route this message per the protocol; `sb threads` / `sb board` for details. '
+            . 'Anything about the statusboard itself (board, sb CLI, hooks, validator) goes ONLY to the developer: `sb dev "title" "brief"`. '
+            . 'Never `sb log` or `sb plan` a thread\'s work yourself: the session that does the work writes the roadmap)';
+        // Known before a spawn fails: small fixes can still go on main, and only the user frees space or allows one more.
+        if (!empty(Store::project($s['project'])['worktree']) && Store::diskGate($s['project'], false))
+            $role .= ' (DISK LOW: new worktrees wait until the user frees space (`sb disk`, the board\'s disk chip). Small fixes still go with `sb spawn --main`; tell the user what is waiting)';
+    } elseif ($s['thread_id']) {
+        $to = Store::threadMaster((int)$s['thread_id']);
+        $role = " (working on thread #{$s['thread_id']} for the master" . ($to ? " \"{$to['name']}\" of {$to['project']}" : '')
+            . ': report back with SendMessage' . ($to ? ' to "' . Store::messageAddress($to) . '" (its address: names are shared across projects, so never send to the name)' : '')
+            . " starting \"#{$s['thread_id']}:\" when you finish or need the user)";
+        // Kept in every prompt: after a /clear the brief that said so is gone, and this tree is shared.
+        $th = Store::thread((int)$s['thread_id']);
+        if (Store::onMain($th)) $role .= ' (ON MAIN: shared main tree, no worktree; edit only with Edit/Write, `sb log` commits just your files by path; never git add -A, commit -a, stash, reset or checkout; no migrations)';
+        elseif ($note = Store::worktreeNote($th)) $role .= " (WORKTREE: $note)";
+    }
+    if ($s['is_developer']) $role .= ' (statusboard DEVELOPER: ' . Store::protocol('developer') . ' + ' . Store::boardDir() . '/DEVELOPER.md)';
+    $adv = Store::clearAdvice($s, $task, 0);
+    $clear = in_array($adv['level'], ['recommended', 'urgent'], true)
+        ? " CONTEXT: {$adv['reason']} Tell the user at the end of your reply if this is a good point to /clear." : '';
+    return "[statusboard] {$s['name']}$role | current task: " . taskLine($task)
+        . '. Protocol (' . Store::protocol('session') . '): quick read-only questions need no task; new work -> `sb new`, analysis map, investigate, solution map + `sb tier` + steps, keep steps updated, prove it per the verification protocol (`sb check`, `sb verify` report, >=90% confidence) before `sb done` or `sb status review`; built work writes its roadmap entry with `sb log -` before `sb handoff`; '
+        . 'a follow-up on the current task stays on it; a message naming a task id -> `sb show <id>` first.'
+        . $clear . pendingFeedback($s['session_id']) . todoReminder($s);
+}
+
+/** Due todos this session owns (the master: also the unowned ones), in every prompt until `sb todo done`. */
+function todoReminder(array $s): string {
+    $due = Store::todosDueFor($s);
+    if (!$due) return '';
+    return "\nTODO DUE (reminders, not work tasks): " . implode(' | ', array_map(fn($t) => "{$t['id']}. {$t['title']}"
+        . ' (' . trim(($t['when_text'] ?? $t['event'] ?? '') . ($t['fired_at'] ? ': happened ' . ago((int)$t['fired_at']) : ($t['due_date'] ? " due {$t['due_date']}" : ''))) . ')'
+        . ($t['detail'] ? " {$t['detail']}" : ''), $due))
+        . ' -> do it (or ask the user when it needs them), then `sb todo done <id>`; `sb todo list` shows the steps.';
+}
+
+/** Warn when another live session has touched the same file for an open task in the last 12h. */
+function collisionWarning(string $sid, string $path): ?string {
+    $rows = Store::all(
+        'SELECT f.session_id, f.task_id, MAX(f.ts) ts, s.name FROM files f LEFT JOIN sessions s USING(session_id)
+         WHERE f.path = ? AND f.session_id != ? AND f.ts > ? GROUP BY f.session_id, f.task_id',
+        [$path, $sid, time() - 43200]
+    );
+    $reg = Store::registry();
+    $hits = [];
+    foreach ($rows as $r) {
+        $task = $r['task_id'] ? Store::task($r['task_id']) : null;
+        if (!($reg[$r['session_id']]['alive'] ?? false) || ($task && !Store::isOpen($task))) continue;
+        $hits[] = ($r['name'] ?? substr($r['session_id'], 0, 8)) . ($task ? " (task {$task['id']} \"{$task['title']}\")" : '') . ' ' . ago((int)$r['ts']);
+    }
+    if (!$hits) return null;
+    return "[statusboard] COLLISION RISK: " . basename($path) . ' was also edited by ' . implode(', ', $hits)
+        . '. Re-read the file before further edits, do not revert their changes, and mention the overlap to the user (or the master).';
+}
+
+/* =====================================================================
+ * Validator side (SB_VALIDATION is set): report findings and the verdict, nothing else.
+ * ===================================================================== */
+
+function validatorCli(string $cmd, array $args): int {
+    // Runs inside the validator's sandbox: no database access, results go to files the runner reads in.
+    $id = (string)getenv('SB_VALIDATION');
+    $dir = Validation::resultsDir($id);
+    if (!is_dir($dir)) @mkdir($dir, 0700, true);
+    $findings = array_values(array_filter(array_map(fn($l) => json_decode($l, true), @file("$dir/findings.jsonl") ?: [])));
+    $done = is_file("$dir/verdict.json");
+    switch ($cmd) {
+        case 'finding':
+            $sev = strtolower($args[0] ?? '');
+            $title = trim($args[1] ?? '');
+            in_array($sev, Validation::SEVERITIES, true) && $title !== '' || fail('usage: sb finding security|blocker|major|minor "title" - <<\'EOF\' (what is wrong, exact repro steps, actual vs expected, where in the code)');
+            if ($done) fail('the verdict is already recorded; findings must come before `sb verdict`');
+            $detail = textArg(array_slice($args, 2)) ?: fail('a finding needs its detail: repro steps, actual vs expected, and the file:line');
+            // One line per finding, appended atomically, so two at once cannot overwrite each other.
+            file_put_contents("$dir/findings.jsonl", json_encode(['severity' => $sev, 'title' => $title, 'detail' => mb_substr($detail, 0, 6000), 'ts' => time()]) . "\n", FILE_APPEND | LOCK_EX)
+                || fail("could not save the finding in $dir (it was NOT recorded)");
+            echo 'Finding ' . (count($findings) + 1) . " logged ($sev).\n";
+            return 0;
+
+        case 'verdict':
+            $verdict = strtolower($args[0] ?? '');
+            $summary = trim($args[1] ?? '');
+            in_array($verdict, ['pass', 'fail'], true) && $summary !== '' || fail('usage: sb verdict pass|fail "one-line summary" - <<\'EOF\' (the report)');
+            if ($done) fail('the verdict is already recorded');
+            $report = textArg(array_slice($args, 2)) ?: fail('the verdict needs the report on stdin (see your protocol for its headings)');
+            $serious = array_filter($findings, fn($f) => ($f['severity'] ?? '') !== 'minor');
+            if ($verdict === 'pass' && $serious) fail('a pass can only carry minor findings; with security, blocker or major findings the verdict is fail');
+            if ($verdict === 'fail' && !$findings) fail('a fail needs at least one `sb finding` saying what is wrong');
+            file_put_contents("$dir/verdict.json", json_encode(['verdict' => $verdict, 'summary' => $summary, 'report' => mb_substr($report, 0, 20000), 'ts' => time()]), LOCK_EX)
+                || fail("could not save the verdict in $dir (it was NOT recorded)");
+            echo "Verdict recorded: $verdict. You are done: stop now.\n";
+            return 0;
+
+        case 'whoami':
+            echo "Validator $id: " . count($findings) . ' finding(s) so far' . ($done ? ', verdict recorded' : '') . ".\n";
+            return 0;
+    }
+    fail('validators may only run `sb finding`, `sb verdict` and `sb whoami`');
+}
+
+function validatorHook(string $vid, string $event, array $in): void {
+    if ($event !== 'PreToolUse') return; // a validator is not a session: no rows, no protocol context
+    $tool = $in['tool_name'] ?? '';
+    $why = null;
+    if ($tool === 'Bash') {
+        $why = Validation::guard((string)($in['tool_input']['command'] ?? ''), Validation::workDir($vid));
+    } elseif (in_array($tool, ['Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'WebFetch', 'WebSearch', 'Agent', 'Task'], true)) {
+        $why = 'validators do not edit files, browse the web or spawn agents';
+    }
+    if ($why === null) return;
+    echo json_encode(['hookSpecificOutput' => [
+        'hookEventName' => 'PreToolUse',
+        'permissionDecision' => 'deny',
+        'permissionDecisionReason' => "[validator guard] $why. Find another way that stays local and read-only, or note it under \"Not covered\".",
+    ]]);
+}

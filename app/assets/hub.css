@@ -1,0 +1,39 @@
+/* Index of boards. Builds on board.css (tokens, .top, .btn, .ghost, .modal, .toast). */
+body.hub { display: block; overflow: auto; height: auto; min-height: 100%; }
+.hub .hint { color: var(--faint); font-size: 12px; }
+.hub-main { max-width: 900px; margin: 0 auto; padding: 16px 16px 48px; }
+
+.hub-list { display: grid; gap: 10px; }
+.hub-card { background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 8px; padding: 12px 14px; display: flex; gap: 12px; align-items: flex-start; flex-wrap: wrap; }
+.hub-card.sb { border-left-color: var(--violet); }
+.hub-card.missing { border-left-color: var(--red); }
+.hub-card .main { flex: 1 1 260px; min-width: 0; }
+.hub-card h3 { margin: 0 0 2px; font-size: 15px; }
+.hub-card h3 a { color: var(--text); text-decoration: none; }
+.hub-card h3 a:hover { color: var(--accent); }
+.hub-card .cwd { font: 12px var(--mono); color: var(--muted); overflow-wrap: anywhere; }
+.hub-card .facts { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 6px; color: var(--muted); font-size: 12px; }
+.hub-card .facts b { color: var(--text); font-weight: 600; }
+.hub-card .facts .warn { color: var(--red); }
+.hub-card .acts { display: flex; gap: 6px; flex-wrap: wrap; }
+.hub-card .acts a { text-decoration: none; }
+
+.hub-create { margin-top: 28px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; }
+.hub-create h2 { margin: 0 0 4px; font-size: 14px; }
+.hub-create form { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
+.hub-create label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+.hub-create input:not([type]) {
+    background: var(--bg); border: 1px solid var(--line-2); color: var(--text); border-radius: 6px; padding: 7px 10px; font: 13px var(--mono); min-width: 0;
+}
+.hub-create .pick-row { display: flex; gap: 6px; }
+.hub-create .pick-row input { flex: 1; }
+.hub-create .pick-row button { flex: none; padding: 0 12px; font-size: 12px; }
+.hub-create .pick-row button:disabled { color: var(--amber); border-color: #fbbf2499; cursor: progress; }
+.hub .chk { flex-direction: row !important; align-items: flex-start !important; gap: 8px; color: var(--text); font-size: 13px; line-height: 1.45; }
+.hub .chk input { margin-top: 3px; flex: none; }
+.hub .chk code, .hub-create code { font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
+.hub-create .r { display: flex; justify-content: flex-end; }
+.hub-result { background: var(--bg); border: 1px solid var(--line-2); border-radius: 6px; padding: 10px; font-size: 12px; overflow-wrap: anywhere; }
+.hub-result ul { margin: 6px 0 0; padding-left: 18px; }
+.hub-empty { color: var(--muted); text-align: center; padding: 32px 16px; }
+#delText { margin: 0; overflow-wrap: anywhere; }
